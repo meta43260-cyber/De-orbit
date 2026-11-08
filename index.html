@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#0c1445">
+    <title>Thai Re-entry Predictor v2.0</title>
+    
+    <!-- PWA -->
+    <link rel="manifest" href="manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="icon" type="image/png" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+    
+    <!-- Libraries -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/satellite.js@5.0.0/dist/satellite.min.js"></script>
+    
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    
+    <style>
+        * { font-family: 'Prompt', sans-serif; }
+        body {
+            background: linear-gradient(135deg, #0c1445 0%, #1a1a2e 50%, #16213e 100%);
+            min-height: 100vh;
+            padding-bottom: env(safe-area-inset-bottom);
+        }
+        .glass {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .neon { text-shadow: 0 0 10px rgba(59, 130, 246, 0.7); }
+        #map { height: 300px; border-radius: 12px; z-index: 1; }
+        .pulse { animation: pulse 2s infinite; }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.7; }
+        }
+        .skeleton {
+            background: linear-gradient(90deg, rgba(255,255,255,0.05) 25%, rgba(255,255,255,0.1) 50%, rgba(255,255,255,0.05) 75%);
+            background-size: 200% 100%;
+            animation: loading 1.5s infinite;
+        }
+        @keyframes loading {
+            0% { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+        .tab-active {
+            background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+        }
+        .safe-bottom {
+            padding-bottom: calc(1rem + env(safe-area-inset-bottom));
+        }
+    </style>
+</head>
+<body class="text-white">
+    <!-- Header -->
+    <header class="bg-gradient-to-r from-blue-900 to-indigo-900 p-4 sticky top-0 z-50 shadow-xl">
+        <div class="flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+                <div class="w-12 h-12 bg-blue-500 rounded-full flex items-center justify-center pulse">
+                    🛰️
+                </div>
+                <div>
+                    <h1 class="text-xl font-bold neon">Re-entry Predictor</h1>
+                    <p class="text-xs text-blue-200">v2.0 Mobile | <span id="status" class="text-green-400">พร้อมใช้</span></p>
+                </div>
+            </div>
+            <div class="flex space-x-2">
+                <button onclick="refreshData()" class="glass px-3 py-2 rounded-lg text-sm">
+                    🔄 รีเฟรช
+                </button>
+                <button onclick="toggleTheme()" class="glass px-3 py-2 rounded-lg text-sm">
+                    🌙
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <main class="p-4 space-y-4 max-w-md mx-auto">
+        <!-- Satellite Selector -->
+        <section class="glass rounded-xl p-4">
+            <label class="text-sm text-blue-200 mb-2 block">เลือกดาวเทียม</label>
+            <select id="satelliteSelect" class="w-full bg-gray-800 rounded-lg p-3 text-white" onchange="changeSatellite(this.value)">
+                <option value="25544">ISS (25544) - ใกล้ตก</option>
+                <option value="43572">COSMOS 2558 (43572)</option>
+                <option value="28485">SWIFT (28485)</option>
+                <option value="12345">อื่นๆ (กรอกเอง)</option>
+            </select>
+            <div id="customInput" class="hidden mt-2">
+                <input type="number" id="customNoradId" placeholder="กรอก NORAD ID" 
+                    class="w-full bg-gray-800 rounded-lg p-3 text-white">
+            </div>
+        </section>
+
+        <!-- Prediction Result Card -->
+        <section id="predictionCard" class="glass rounded-xl p-6 bg-gradient-to-br from-green-900/50 to-blue-900/50">
+            <div class="flex items-center justify-between mb-4">
+                <h2 class="text-lg font-bold text-green-400">🎯 ผลการพยากรณ์</h2>
+                <span id="confidenceBadge" class="bg-green-500 text-xs px-2 py-1 rounded-full">72%</span>
+            </div>
+            
+            <div class="grid grid-cols-2 gap-3 mb-4">
+                <div class="bg-black/30 rounded-lg p-3">
+                    <p class="text-xs text-gray-400">เวลา UTC</p>
+                    <p id="utcTime" class="text-lg font-bold">-</p>
+                    <p id="utcUncertainty" class="text-xs text-blue-300">-</p>
+                </div>
+                <div class="bg-black/30 rounded-lg p-3">
+                    <p class="text-xs text-gray-400">เวลาไทย (ICT)</p>
+                    <p id="ictTime" class="text-lg font-bold text-yellow-400">-</p>
+                    <p id="ictUncertainty" class="text-xs text-yellow-300">-</p>
+                </div>
+            </div>
+
+            <div class="flex items-center space-x-4 text-sm">
+                <div class="flex items-center space-x-2">
+                    <span class="text-2xl">🌍</span>
+                    <div>
+                        <p class="text-xs text-gray-400">พื้นที่เสี่ยง</p>
+                        <p id="impactZone" class="font-semibold">-</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Learning Status -->
+        <section class="glass rounded-xl p-4">
+            <div class="flex items-center justify-between mb-2">
+                <h3 class="font-semibold">🧠 ระบบการเรียนรู้</h3>
+                <span id="learningStatus" class="text-xs text-purple-400">กำลังเรียนรู้...</span>
+            </div>
+            <div class="flex items-center space-x-2 text-sm">
+                <div class="flex-1 bg-gray-700 rounded-full h-2">
+                    <div id="learningProgress" class="bg-gradient-to-r from-purple-500 to-pink-500 h-2 rounded-full transition-all" style="width: 45%"></div>
+                </div>
+                <span id="learningPercent" class="text-xs">45%</span>
+            </div>
+            <p class="text-xs text-gray-400 mt-2" id="learningInfo">เก็บข้อมูลแล้ว 12 ครั้ง / เป้าหมาย 30 ครั้ง</p>
+        </section>
+
+        <!-- Tabs -->
+        <div class="flex space-x-2 overflow-x-auto">
+            <button onclick="showTab('map')" class="tab-btn tab-active px-4 py-2 rounded-lg text-sm whitespace-nowrap">🗺️ แผนที่</button>
+            <button onclick="showTab('decay')" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📉 กราฟ</button>
+            <button onclick="showTab('details')" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📊 รายละเอียด</button>
+            <button onclick="showTab('learning')" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">🎓 เรียนรู้</button>
+        </div>
+
+        <!-- Tab Content -->
+        <div id="tab-map" class="tab-content">
+            <section class="glass rounded-xl p-4">
+                <h3 class="font-semibold mb-3">🗺️ เส้นทางการโคจร</h3>
+                <div id="map"></div>
+                <div class="mt-3 flex flex-wrap gap-2 text-xs">
+                    <span class="flex items-center space-x-1">
+                        <span class="w-4 h-1 bg-yellow-400"></span>
+                        <span>วงโคจร</span>
+                    </span>
+                    <span class="flex items-center space-x-1">
+                        <span class="w-4 h-1 bg-red-500"></span>
+                        <span>พื้นที่เสี่ยง</span>
+                    </span>
+                    <span class="flex items-center space-x-1">
+                        <span class="w-3 h-3 bg-red-500 rounded-full"></span>
+                        <span>ตำแหน่งปัจจุบัน</span>
+                    </span>
+                </div>
+            </section>
+        </div>
+
+        <div id="tab-decay" class="tab-content hidden">
+            <section class="glass rounded-xl p-4">
+                <h3 class="font-semibold mb-3">📉 การลดลงของวงโคจร</h3>
+                <div style="height: 250px;">
+                    <canvas id="decayChart"></canvas>
+                </div>
+            </section>
+            <section class="glass rounded-xl p-4 mt-4">
+                <h3 class="font-semibold mb-3">🎯 ช่วงเวลาที่น่าจะเป็นไปได้</h3>
+                <div style="height: 200px;">
+                    <canvas id="probabilityChart"></canvas>
+                </div>
+            </section>
+        </div>
+
+        <div id="tab-details" class="tab-content hidden">
+            <section class="glass rounded-xl p-4">
+                <h3 class="font-semibold mb-3">📊 ข้อมูลวงโคจร</h3>
+                <div class="space-y-2 text-sm">
+                    <div class="flex justify-between"><span class="text-gray-400">NORAD ID:</span><span id="noradId">-</span></div>
+                    <div class="flex justify-between"><span class="text-gray-400">มุมเอียง:</span><span id="inclination">-</span></div>
+                    <div class="flex justify-between"><span class="text-gray-400">ความสูงปัจจุบัน:</span><span id="currentAlt">-</span></div>
+                    <div class="flex justify-between"><span class="text-gray-400">ค่า B*:</span><span id="bstar">-</span></div>
+                    <div class="flex justify-between"><span class="text-gray-400">Space Weather (Kp):</span><span id="kpIndex">-</span></div>
+                    <div class="flex justify-between"><span class="text-gray-400">TLE Age:</span><span id="tleAge">-</span></div>
+                    <div class="flex justify-between"><span class="text-gray-400">Kalman Confidence:</span><span id="kalmanConf">-</span></div>
+                    <div class="flex justify-between"><span class="text-gray-400">Ensemble Models:</span><span id="ensembleModels">-</span></div>
+                </div>
+            </section>
+        </div>
+
+        <div id="tab-learning" class="tab-content hidden">
+            <section class="glass rounded-xl p-4">
+                <h3 class="font-semibold mb-3">🎓 ประวัติการเรียนรู้</h3>
+                <div id="learningHistory" class="space-y-2 text-sm max-h-96 overflow-y-auto">
+                    <p class="text-gray-400 text-center py-8">ยังไม่มีข้อมูลการเรียนรู้</p>
+                </div>
+                <button onclick="clearLearningData()" class="mt-3 w-full glass px-4 py-2 rounded-lg text-sm text-red-400">
+                    🗑️ ล้างข้อมูลการเรียนรู้
+                </button>
+            </section>
+        </div>
+
+        <!-- Disclaimer -->
+        <section class="text-xs text-gray-400 text-center p-4">
+            ⚠️ ผลการพยากรณ์นี้เป็นการประมาณการจากข้อมูล TLE<br>
+            อาจมีความคลาดเคลื่อน ±หลายชั่วโมง
+        </section>
+    </main>
+
+    <!-- Scripts -->
+    <script src="api.js"></script>
+    <script src="algorithms.js"></script>
+    <script src="learning.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

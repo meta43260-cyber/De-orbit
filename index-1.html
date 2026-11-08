@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="theme-color" content="#0c1445">
+<title>Thai Re-entry Predictor v4</title>
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/satellite.js@5.0.0/dist/satellite.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{font-family:'Prompt',sans-serif}
+body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-height:100vh}
+.glass{background:rgba(255,255,255,.05);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.1)}
+.neon{text-shadow:0 0 10px rgba(59,130,246,.7)}
+#map{height:300px;border-radius:12px;z-index:1}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.08);opacity:.8}}
+.tab-active{background:linear-gradient(90deg,#3b82f6,#8b5cf6)}
+</style>
+</head>
+<body class="text-white">
+
+<header class="bg-gradient-to-r from-blue-900 to-indigo-900 p-4 sticky top-0 z-50 shadow-xl">
+  <div class="flex items-center justify-between max-w-md mx-auto">
+    <div class="flex items-center space-x-3">
+      <div class="w-12 h-12 bg-blue-500 rounded-full flex items-center justify-center pulse text-2xl">🛰️</div>
+      <div>
+        <h1 class="text-xl font-bold neon">Re-entry Predictor</h1>
+        <p class="text-xs text-blue-200">v4 | <span id="status" class="text-yellow-400">กำลังโหลด...</span></p>
+      </div>
+    </div>
+    <button onclick="refreshAll(true)" aria-label="อัปเดตข้อมูล" class="glass px-3 py-2 rounded-lg text-sm">🔄</button>
+  </div>
+</header>
+
+<main class="p-4 space-y-4 max-w-md mx-auto">
+
+  <section class="glass rounded-xl p-4">
+    <label class="text-sm text-blue-200 mb-2 block">NORAD Catalog ID</label>
+    <div class="flex space-x-2">
+      <input type="number" inputmode="numeric" id="noradInput" placeholder="กรอกเลข NORAD"
+        class="flex-1 bg-gray-800 rounded-lg p-3 text-white text-lg">
+      <button onclick="predictFromInput()" class="bg-blue-600 px-5 py-3 rounded-lg text-lg">🔍</button>
+    </div>
+  </section>
+
+  <section class="glass rounded-xl p-5 bg-gradient-to-br from-green-900/40 to-blue-900/40">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-lg font-bold text-green-400">🎯 ผลการพยากรณ์</h2>
+      <span id="confidenceBadge" class="text-xs px-2 py-1 rounded-full bg-gray-600" title="คะแนนคุณภาพข้อมูลแบบฮิวริสติก ไม่ใช่ความน่าจะเป็น">-</span>
+    </div>
+    <div class="grid grid-cols-2 gap-3 mb-4">
+      <div class="bg-black/30 rounded-lg p-3">
+        <p class="text-xs text-gray-400">เวลา UTC</p>
+        <p id="utcTime" class="text-base font-bold">-</p>
+        <p id="utcUncertainty" class="text-xs text-blue-300">-</p>
+      </div>
+      <div class="bg-black/30 rounded-lg p-3">
+        <p class="text-xs text-gray-400">เวลาไทย (ICT)</p>
+        <p id="ictTime" class="text-base font-bold text-yellow-400">-</p>
+        <p id="ictUncertainty" class="text-xs text-yellow-300">-</p>
+      </div>
+    </div>
+    <p class="text-sm">🌍 แนวผ่านวงโคจร: <span id="impactZone" class="font-semibold">-</span></p>
+  </section>
+
+  <section class="glass rounded-xl p-4">
+    <div class="flex items-center justify-between mb-2">
+      <h3 class="font-semibold">📈 สถิติความแม่นยำ</h3>
+      <span id="learningStatus" class="text-xs text-purple-400">-</span>
+    </div>
+    <div class="flex items-center space-x-2">
+      <div class="flex-1 bg-gray-700 rounded-full h-2">
+        <div id="learningProgress" class="bg-gradient-to-r from-purple-500 to-pink-500 h-2 rounded-full" style="width:0%"></div>
+      </div>
+      <span id="learningPercent" class="text-xs">0%</span>
+    </div>
+    <p class="text-xs text-gray-400 mt-2" id="learningInfo">-</p>
+  </section>
+
+  <div class="flex space-x-2 overflow-x-auto pb-1">
+    <button onclick="showTab('map',this)" class="tab-btn tab-active px-4 py-2 rounded-lg text-sm whitespace-nowrap">🗺️ แผนที่</button>
+    <button onclick="showTab('decay',this)" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📉 กราฟ</button>
+    <button onclick="showTab('details',this)" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📊 รายละเอียด</button>
+    <button onclick="showTab('learning',this)" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📈 บันทึกผลจริง</button>
+  </div>
+
+  <div id="tab-map" class="tab-content">
+    <section class="glass rounded-xl p-4">
+      <h3 class="font-semibold mb-3">🗺️ เส้นทางการโคจร</h3>
+      <div id="map"></div>
+      <div class="mt-3 flex gap-4 text-xs">
+        <span><span class="inline-block w-4 h-1 bg-yellow-400"></span> วงโคจร</span>
+        <span><span class="inline-block w-4 h-1 bg-red-500"></span> ขอบละติจูดที่วงโคจรผ่าน</span>
+        <span><span class="inline-block w-3 h-3 bg-blue-500 rounded-full"></span> ตำแหน่งปัจจุบัน</span>
+      </div>
+    </section>
+  </div>
+
+  <div id="tab-decay" class="tab-content hidden">
+    <section class="glass rounded-xl p-4">
+      <h3 class="font-semibold mb-3">📉 การลดลงของความสูง</h3>
+      <div style="height:220px"><canvas id="decayChart"></canvas></div>
+    </section>
+    <section class="glass rounded-xl p-4 mt-4">
+      <h3 class="font-semibold mb-3">🎯 ช่วงเวลาที่เป็นไปได้ (ประมาณ)</h3>
+      <div style="height:180px"><canvas id="probabilityChart"></canvas></div>
+    </section>
+  </div>
+
+  <div id="tab-details" class="tab-content hidden">
+    <section class="glass rounded-xl p-4 space-y-2 text-sm">
+      <h3 class="font-semibold mb-1">📊 ข้อมูลวงโคจร</h3>
+      <div class="flex justify-between"><span class="text-gray-400">NORAD ID:</span><span id="noradId">-</span></div>
+      <div class="flex justify-between"><span class="text-gray-400">มุมเอียง:</span><span id="inclination">-</span></div>
+      <div class="flex justify-between"><span class="text-gray-400">ความสูงปัจจุบัน:</span><span id="currentAlt">-</span></div>
+      <div class="flex justify-between"><span class="text-gray-400">ค่า B*:</span><span id="bstar">-</span></div>
+      <div class="flex justify-between"><span class="text-gray-400">Space Weather (Kp):</span><span id="kpIndex">-</span></div>
+      <div class="flex justify-between"><span class="text-gray-400">อายุข้อมูล TLE:</span><span id="tleAge">-</span></div>
+      <div class="flex justify-between"><span class="text-gray-400">โมเดลที่ใช้:</span><span id="ensembleModels">-</span></div>
+      <div class="flex justify-between"><span class="text-gray-400">แหล่งข้อมูล:</span><span id="dataSource">-</span></div>
+    </section>
+  </div>
+
+  <div id="tab-learning" class="tab-content hidden">
+    <section class="glass rounded-xl p-4">
+      <h3 class="font-semibold mb-1">📈 บันทึกผลจริง</h3>
+      <p class="text-xs text-gray-400 mb-3">เมื่อวัตถุตกจริง ให้บันทึกเวลา (ตามเวลาเครื่องของคุณ) เพื่อดูว่าการพยากรณ์คลาดเคลื่อนเท่าไร ระบบนี้เก็บสถิติเท่านั้น ไม่ได้ปรับโมเดลอัตโนมัติ</p>
+      <div class="flex flex-col gap-2 mb-4">
+        <select id="actualId" class="bg-gray-800 rounded-lg p-2 text-white text-sm"></select>
+        <input type="datetime-local" id="actualTime" class="bg-gray-800 rounded-lg p-2 text-white text-sm">
+        <button onclick="submitActual()" class="bg-blue-600 px-4 py-2 rounded-lg text-sm">บันทึกเวลาตกจริง</button>
+      </div>
+      <h4 class="text-sm font-semibold mb-2">ประวัติการพยากรณ์</h4>
+      <div id="learningHistory" class="space-y-2 text-sm max-h-96 overflow-y-auto">
+        <p class="text-gray-400 text-center py-8">ยังไม่มีข้อมูล</p>
+      </div>
+      <button onclick="clearLearningData()" class="mt-3 w-full glass px-4 py-2 rounded-lg text-sm text-red-400">🗑️ ล้างสถิติและบันทึกผล</button>
+    </section>
+  </div>
+
+  <p class="text-xs text-gray-400 text-center py-4">⚠️ ประมาณการจากข้อมูล TLE สาธารณะด้วยโมเดลง่าย ๆ ไม่ใช่การพยากรณ์ระดับปฏิบัติการ ค่า "คุณภาพ" เป็นคะแนนแบบฮิวริสติก ไม่ใช่ความน่าจะเป็น และไม่สามารถระบุจุดตกได้ ควรอ้างอิงประกาศจากหน่วยงานทางการเมื่อต้องตัดสินใจ</p>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

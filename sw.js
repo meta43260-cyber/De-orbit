@@ -1,73 +1,22 @@
-const CACHE_NAME = 'reentry-v2.1';
-const urlsToCache = [
-    '/',
-    '/index.html',
-    '/script.js',
-    '/algorithms.js',
-    '/learning.js',
-    '/api.js',
-    '/manifest.json'
-];
-
-// Install
-self.addEventListener('install', event => {
-    event.waitUntil(
-        caches.open(CACHE_NAME)
-            .then(cache => cache.addAll(urlsToCache))
-    );
-    self.skipWaiting();
+const CACHE = 'reentry-v3';
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(['./', 'index.html'])));
+  self.skipWaiting();
 });
-
-// Activate
-self.addEventListener('activate', event => {
-    event.waitUntil(
-        caches.keys().then(keys => 
-            Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))
-        )
-    );
-    self.clients.claim();
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k)))));
+  self.clients.claim();
 });
-
-// Fetch
-self.addEventListener('fetch', event => {
-    event.respondWith(
-        caches.match(event.request)
-            .then(response => {
-                if (response) {
-                    // Fetch from network and update cache (stale-while-revalidate)
-                    fetch(event.request).then(fetchRes => {
-                        caches.open(CACHE_NAME).then(cache => {
-                            cache.put(event.request, fetchRes);
-                        });
-                    }).catch(() => {});
-                    return response;
-                }
-                
-                return fetch(event.request).then(response => {
-                    if (!response || response.status !== 200) {
-                        return response;
-                    }
-                    
-                    const responseClone = response.clone();
-                    caches.open(CACHE_NAME).then(cache => {
-                        cache.put(event.request, responseClone);
-                    });
-                    
-                    return response;
-                });
-            })
-            .catch(() => caches.match('/index.html'))
-    );
+self.addEventListener('fetch', e => {
+  if (e.request.mode === 'navigate') {
+    e.respondWith(fetch(e.request).then(r => {
+      caches.open(CACHE).then(c => c.put(e.request, r.clone()));
+      return r;
+    }).catch(() => caches.match(e.request)));
+  } else {
+    e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).then(res => {
+      caches.open(CACHE).then(c => c.put(e.request, res.clone()));
+      return res;
+    })));
+  }
 });
-
-// Background Sync for recording actual re-entries
-self.addEventListener('sync', event => {
-    if (event.tag === 'sync-reentry') {
-        event.waitUntil(syncReentryData());
-    }
-});
-
-async function syncReentryData() {
-    // Sync learning data to cloud (if you add backend later)
-    console.log('Syncing reentry data...');
-}

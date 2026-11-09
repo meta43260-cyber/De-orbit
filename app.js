@@ -553,6 +553,8 @@ function tleAgeLabel(epoch){
   return age;
 }
 async function fetchCloudTLE(){
+  const info=document.getElementById('cloudTleInfo');
+  if(info) info.textContent='กำลังเริ่มติดต่อ Backend…';
   const btn=document.getElementById('fetchCloudTleBtn');
   const status=document.getElementById('simRunStatus');
   const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
@@ -579,14 +581,12 @@ async function fetchCloudTLE(){
     const freshness=ageHours>72?'ข้อมูลเก่ากว่า 72 ชั่วโมง — ควรตรวจสอบก่อนจำลอง':ageHours>24?'ข้อมูลเก่ากว่า 24 ชั่วโมง':'ข้อมูลค่อนข้างใหม่';
     const color=ageHours>72?'text-red-300':ageHours>24?'text-yellow-300':'text-green-300';
     setCloudTleInfo('✓ '+cloudTle.name+' (#'+id+') · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+' · '+cloudTle.source+' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness,color);
-    status.textContent='รับ TLE แล้ว — พร้อมส่งเข้าแบบจำลอง';
-    status.className='text-xs text-green-300';
+    if(status){status.textContent='รับ TLE แล้ว — พร้อมส่งเข้าแบบจำลอง';status.className='text-xs text-green-300';}
   }catch(err){
     cloudTle=null;
     const msg=err.name==='AbortError'?'หมดเวลารอ Backend (90 วินาที) — ตรวจสอบ Render ว่าบริการทำงานอยู่':err.message;
     setCloudTleInfo('ดึง TLE ไม่สำเร็จ: '+msg,'text-red-300');
-    status.textContent='ดึง TLE ไม่สำเร็จ: '+msg;
-    status.className='text-xs text-red-300';
+    if(status){status.textContent='ดึง TLE ไม่สำเร็จ: '+msg;status.className='text-xs text-red-300';}
   }finally{
     btn.disabled=false;btn.classList.remove('opacity-50');
   }

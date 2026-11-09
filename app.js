@@ -589,7 +589,7 @@ async function fetchCloudTLE(){
     const candidateLines=(data.candidates||[]).map((x,i)=>
       (i+1)+'. '+x.source+' · Epoch '+new Date(x.epoch_utc).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC'+(x.source===data.selected_source?' ← เลือกใช้':'')
     );
-    const detailText='✓ '+cloudTle.name+' (#'+id+') · เลือก '+cloudTle.source+' ด้วย Epoch ใหม่ที่สุด · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness+'\\n\\nผลตรวจแหล่งข้อมูล:\\n'+sourceLines.join('\\n')+'\\n\\nชุด TLE ที่ผ่านการตรวจสอบ:\\n'+candidateLines.join('\\n')+'\\n\\nหมายเหตุ: '+(data.source_independence_note||'แหล่งข้อมูลอาจมีต้นทางร่วมกัน'));
+    const detailText='✓ '+cloudTle.name+' (#'+id+') · เลือก '+cloudTle.source+' ด้วย Epoch ใหม่ที่สุด · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness+'\n\nผลตรวจแหล่งข้อมูล:\n'+sourceLines.join('\n')+'\n\nชุด TLE ที่ผ่านการตรวจสอบ:\n'+candidateLines.join('\n')+'\n\nหมายเหตุ: '+(data.source_independence_note||'แหล่งข้อมูลอาจมีต้นทางร่วมกัน'));
     setCloudTleInfo(detailText,color);
     if(status){status.textContent='รับ TLE แล้ว — พร้อมส่งเข้าแบบจำลอง';status.className='text-xs text-green-300';}
   }catch(err){

@@ -48,10 +48,35 @@ const HKEY=id=>'reentry_hist_'+id,CKEY=id=>'reentry_cache_'+id;
 function loadLocalHist(id){try{return JSON.parse(localStorage.getItem(HKEY(id)))||[];}catch(e){return[];}}
 function saveLocalHist(id,arr){try{localStorage.setItem(HKEY(id),JSON.stringify(arr.slice(-200)));}catch(e){}}
 function collectTLE(id,tle){const arr=loadLocalHist(id);if(!arr.some(x=>Math.abs(x.epoch-tle.epoch)<HOUR)){arr.push(tle);arr.sort((a,b)=>a.epoch-b.epoch);saveLocalHist(id,arr);}return arr;}
+function collectCatalogRecord(id,record){
+  const arr=loadLocalHist(id);
+  const epoch=Number(record.epoch);
+  if(!Number.isFinite(epoch))throw new Error('OMM Epoch ไม่ถูกต้อง');
+  const index=arr.findIndex(x=>Math.abs(Number(x.epoch)-epoch)<1000);
+  if(index>=0)arr[index]=Object.assign({},arr[index],record,{epoch:epoch});
+  else arr.push(Object.assign({},record,{epoch:epoch}));
+  arr.sort((a,b)=>a.epoch-b.epoch);
+  saveLocalHist(id,arr);
+  return arr;
+}
 function loadCache(id){try{return JSON.parse(localStorage.getItem(CKEY(id)));}catch(e){return null;}}
 function saveCache(id,tle){try{localStorage.setItem(CKEY(id),JSON.stringify({t:Date.now(),tle:tle}));}catch(e){}}
 async function fetchTLE(id){
   let tle=null;
+  const apiBase=(localStorage.getItem('reentryApiBase')||'').trim().replace(/\\/+$/,'');
+  if(apiBase){
+    try{
+      const response=await fetch(apiBase+'/api/v1/omm/'+encodeURIComponent(id),{headers:{'Accept':'application/json'}});
+      if(response.ok){
+        const data=await response.json(),ex=data.tle_export;
+        if(Number(data.catalog_id)===Number(id)&&ex&&validTLE(ex.line1,ex.line2,id)){
+          tle={name:data.name||('NORAD '+id),line1:ex.line1,line2:ex.line2,epoch:parseTLEEpoch(ex.line1),
+            source:data.source||'Cloud OMM',source_url:data.source_url||'',omm_fields:data.omm_fields||null,format:'OMM+TLE'};
+          collectCatalogRecord(id,tle);saveCache(id,tle);return tle;
+        }
+      }
+    }catch(e){console.warn('Cloud OMM unavailable; using legacy TLE feeds:',e.message);}
+  }
   try{
     const t=await fetchText('https://celestrak.org/NORAD/elements/gp.php?CATNR='+id+'&FORMAT=tle',8000,
       txt=>parseTLEBulk(txt,id).length>0||/No GP data/i.test(txt));
@@ -553,29 +578,29 @@ function tleAgeLabel(epoch){
   return age;
 }
 async function fetchCloudTLE(){
-  const info=document.getElementById('cloudTleInfo');
-  if(info) info.textContent='กำลังเริ่มติดต่อ Backend…';
   const btn=document.getElementById('fetchCloudTleBtn');
   const status=document.getElementById('simRunStatus');
-  const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
+  const base=document.getElementById('apiBaseUrl').value.trim().replace(/\\/+$/,'');
   const id=String(document.getElementById('cloudNoradInput').value||document.getElementById('noradInput').value||curNorad||'').trim();
   try{
     if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
-    if(!/^\d{1,5}$/.test(id)||Number(id)<1||Number(id)>99999)throw new Error('TLE แบบ 2-line รองรับ NORAD ID 1–99999; ID 6 หลักต้องใช้ OMM/JSON');
+    if(!/^\\d{1,6}$/.test(id)||Number(id)<1||Number(id)>999999)throw new Error('Catalog ID ต้องเป็นตัวเลข 1–999999');
     localStorage.setItem('reentryApiBase',base);
     btn.disabled=true;btn.classList.add('opacity-50');
-    setCloudTleInfo('กำลังติดต่อ Backend… หาก Render เพิ่งพักบริการ อาจใช้เวลาเริ่มระบบ 30–60 วินาที','text-yellow-300');
-    const controller=new AbortController();
-    const timer=setTimeout(()=>controller.abort(),90000);
+    setCloudTleInfo('กำลังดึง OMM/JSON จากหลายแหล่ง… หาก Render เพิ่งพักบริการ อาจใช้เวลาเริ่มระบบ 30–60 วินาที','text-yellow-300');
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),90000);
     let response;
-    try{response=await fetch(base+'/api/v1/tle/'+encodeURIComponent(id),{method:'GET',headers:{'Accept':'application/json'},signal:controller.signal});}
+    try{response=await fetch(base+'/api/v1/omm/'+encodeURIComponent(id),{method:'GET',headers:{'Accept':'application/json'},signal:controller.signal});}
     finally{clearTimeout(timer);}
     const data=await response.json().catch(()=>({}));
     if(!response.ok)throw new Error((data.detail&&typeof data.detail==='object'?data.detail.message:data.detail)||('Backend ตอบ HTTP '+response.status));
-    if(Number(data.norad_id)!==Number(id)||!validTLE(data.line1,data.line2,id))throw new Error('TLE ที่ได้รับไม่ผ่านการตรวจสอบ NORAD ID หรือ checksum');
-    const epochMs=new Date(data.epoch_utc).getTime();
-    if(!Number.isFinite(epochMs))throw new Error('Backend ส่ง Epoch ที่อ่านไม่ได้');
-    cloudTle={norad_id:Number(id),name:data.name||('NORAD '+id),line1:data.line1,line2:data.line2,epoch:epochMs,epoch_utc:data.epoch_utc,source:data.source||'ไม่ระบุ',source_url:data.source_url||'',fetched_at_utc:data.fetched_at_utc||new Date().toISOString()};
+    if(Number(data.catalog_id)!==Number(id)||!data.omm_fields||!Number.isFinite(new Date(data.epoch_utc).getTime()))throw new Error('OMM ไม่ผ่านการตรวจสอบ Catalog ID หรือ Epoch');
+    const epochMs=new Date(data.epoch_utc).getTime(),ex=data.tle_export||null;
+    if(ex&&!validTLE(ex.line1,ex.line2,id))throw new Error('TLE export จาก OMM ไม่ผ่าน checksum');
+    cloudTle={norad_id:Number(id),name:data.name||('CATALOG '+id),line1:ex?ex.line1:null,line2:ex?ex.line2:null,
+      omm_fields:data.omm_fields,format:'OMM',epoch:epochMs,epoch_utc:data.epoch_utc,source:data.source||'ไม่ระบุ',
+      source_url:data.source_url||'',fetched_at_utc:data.fetched_at_utc||new Date().toISOString()};
+    collectCatalogRecord(id,cloudTle);
     document.getElementById('cloudNoradInput').value=id;
     const ageHours=(Date.now()-epochMs)/HOUR;
     const freshness=ageHours>72?'ข้อมูลเก่ากว่า 72 ชั่วโมง — ควรตรวจสอบก่อนจำลอง':ageHours>24?'ข้อมูลเก่ากว่า 24 ชั่วโมง':'ข้อมูลค่อนข้างใหม่';
@@ -583,23 +608,22 @@ async function fetchCloudTLE(){
     const sourceLines=(data.sources_checked||[]).map(x=>{
       const mark=x.status==='ok'?'✓':'✕';
       const epoch=x.epoch_utc?' · Epoch '+new Date(x.epoch_utc).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC':'';
-      const err=x.error?' · '+x.error:'';
-      return mark+' '+x.source+epoch+err;
+      return mark+' '+x.source+epoch+(x.error?' · '+x.error:'');
     });
-    const candidateLines=(data.candidates||[]).map((x,i)=>
-      (i+1)+'. '+x.source+' · Epoch '+new Date(x.epoch_utc).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC'+(x.source===data.selected_source?' ← เลือกใช้':'')
-    );
-    const detailText='✓ '+cloudTle.name+' (#'+id+') · เลือก '+cloudTle.source+' ด้วย Epoch ใหม่ที่สุด · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness+'\n\nผลตรวจแหล่งข้อมูล:\n'+sourceLines.join('\n')+'\n\nชุด TLE ที่ผ่านการตรวจสอบ:\n'+candidateLines.join('\n')+'\n\nหมายเหตุ: '+(data.source_independence_note||'แหล่งข้อมูลอาจมีต้นทางร่วมกัน'));
+    const candidateLines=(data.candidates||[]).map((x,i)=>(i+1)+'. '+x.source+' · Epoch '+new Date(x.epoch_utc).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC'+(x.source===data.selected_source?' ← เลือกใช้':''));
+    const detailText='✓ '+cloudTle.name+' (#'+id+') · OMM · '+(ex?'มี TLE export สำหรับระบบเดิม':'Catalog ID 6 หลัก ใช้ OMM โดยตรง')+
+      ' · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+
+      ' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness+
+      '\\n\\nผลตรวจแหล่งข้อมูล:\\n'+sourceLines.join('\\n')+'\\n\\nชุด OMM ที่ผ่านการตรวจสอบ:\\n'+candidateLines.join('\\n')+
+      '\\n\\nหมายเหตุ: '+(data.source_independence_note||'แหล่งข้อมูลอาจมีต้นทางร่วมกัน');
     setCloudTleInfo(detailText,color);
-    if(status){status.textContent='รับ TLE แล้ว — พร้อมส่งเข้าแบบจำลอง';status.className='text-xs text-green-300';}
+    if(status){status.textContent='รับ OMM แล้ว — บันทึกเข้าประวัติ TLE กลางในเครื่อง และพร้อมจำลองบน Cloud';status.className='text-xs text-green-300';}
   }catch(err){
     cloudTle=null;
     const msg=err.name==='AbortError'?'หมดเวลารอ Backend (90 วินาที) — ตรวจสอบ Render ว่าบริการทำงานอยู่':err.message;
-    setCloudTleInfo('ดึง TLE ไม่สำเร็จ: '+msg,'text-red-300');
-    if(status){status.textContent='ดึง TLE ไม่สำเร็จ: '+msg;status.className='text-xs text-red-300';}
-  }finally{
-    btn.disabled=false;btn.classList.remove('opacity-50');
-  }
+    setCloudTleInfo('ดึง OMM ไม่สำเร็จ: '+msg,'text-red-300');
+    if(status){status.textContent='ดึง OMM ไม่สำเร็จ: '+msg;status.className='text-xs text-red-300';}
+  }finally{btn.disabled=false;btn.classList.remove('opacity-50');}
 }
 window.fetchCloudTLE=fetchCloudTLE;
 
@@ -611,11 +635,12 @@ async function runCloudSimulation(){
     const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
     if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
     localStorage.setItem('reentryApiBase',base);
-    if(!cloudTle)throw new Error('กรุณากรอก NORAD ID แล้วกด “ดึง TLE” ก่อนเริ่มจำลอง');
+    if(!cloudTle)throw new Error('กรุณากรอก Catalog ID แล้วกด “ดึง OMM/TLE” ก่อนเริ่มจำลอง');
     const number=id=>Number(document.getElementById(id).value);
     const payload={
-      tle_line1:cloudTle.line1,
-      tle_line2:cloudTle.line2,
+      tle_line1:cloudTle.line1||null,
+      tle_line2:cloudTle.line2||null,
+      omm_fields:cloudTle.omm_fields||null,
       start_time_utc:new Date().toISOString(),
       max_search_hours:168,
       max_simulation_seconds:1800,

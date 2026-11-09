@@ -29,7 +29,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "6.5.0-unified-archive-backup"
+APP_VERSION = "6.6.0-archive-audit-recovery"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -40,7 +40,7 @@ ENTRY_ALT_DEFAULT_KM = 120.0
 MSIS_VERSION = 0             # NRLMSISE-00 (not MSIS 2.x)
 
 app = FastAPI(
-    title="Thai Re-entry Predictor API v6.5",
+    title="Thai Re-entry Predictor API v6.6",
     version=APP_VERSION,
     description="Advanced phone-cloud orbital decay, offline OMM ingestion, verified archive backup and controlled recovery API; research prototype, not an operational forecast.",
 )
@@ -1501,6 +1501,144 @@ def v6_backup_status():
     except Exception as exc:
         raise HTTPException(status_code=503, detail={
             "status": "unavailable", "error": str(exc)[:200],
+            "gp_history_requested": False
+        }) from exc
+
+
+@app.get("/api/v1/v6/backup/audit")
+def v6_backup_audit():
+    """Read-only integrity audit of all archive tables; never calls Space-Track."""
+    try:
+        conn = _history_db()
+        try:
+            states = conn.execute("""
+                SELECT catalog_id, status, attempted_at_utc, completed_at_utc,
+                       record_count, error
+                FROM omm_history_fetches ORDER BY catalog_id
+            """).fetchall()
+            history_rows = conn.execute("""
+                SELECT catalog_id, epoch_utc, creation_date, source, payload_json
+                FROM omm_history_records ORDER BY catalog_id, epoch_utc
+            """).fetchall()
+            offline_rows = conn.execute("""
+                SELECT catalog_id, epoch_utc, source, payload_json, imported_at_utc
+                FROM omm_offline_records ORDER BY catalog_id, epoch_utc, source
+            """).fetchall()
+        finally:
+            conn.close()
+
+        issues = []
+        warnings = []
+        state_by_id = {}
+        for row in states:
+            cid = int(row["catalog_id"])
+            if cid in state_by_id:
+                issues.append({"code": "duplicate_fetch_state", "catalog_id": cid})
+            state_by_id[cid] = dict(row)
+            if row["status"] not in ("completed", "failed_no_auto_retry"):
+                issues.append({"code": "unknown_fetch_status", "catalog_id": cid, "status": row["status"]})
+            if int(row["record_count"] or 0) < 0:
+                issues.append({"code": "negative_fetch_record_count", "catalog_id": cid})
+
+        history_counts = {}
+        history_keys = set()
+        for index, row in enumerate(history_rows):
+            cid = int(row["catalog_id"])
+            epoch = str(row["epoch_utc"])
+            history_counts[cid] = history_counts.get(cid, 0) + 1
+            key = (cid, epoch)
+            if key in history_keys:
+                issues.append({"code": "duplicate_history_key", "catalog_id": cid, "epoch_utc": epoch})
+            history_keys.add(key)
+            state = state_by_id.get(cid)
+            if state is None or state["status"] != "completed":
+                issues.append({"code": "history_record_without_completed_fetch", "catalog_id": cid, "epoch_utc": epoch})
+            try:
+                payload = json.loads(row["payload_json"])
+                payload_id = int(payload.get("NORAD_CAT_ID", payload.get("NORAD_CATID", 0)))
+                payload_epoch = as_utc(datetime.fromisoformat(str(payload["EPOCH"]).replace("Z", "+00:00"))).isoformat()
+                stored_epoch = as_utc(datetime.fromisoformat(epoch.replace("Z", "+00:00"))).isoformat()
+                if payload_id != cid or payload_epoch != stored_epoch:
+                    issues.append({"code": "history_payload_metadata_mismatch", "catalog_id": cid, "epoch_utc": epoch})
+            except Exception as exc:
+                issues.append({"code": "invalid_history_payload", "catalog_id": cid, "epoch_utc": epoch, "error": str(exc)[:120]})
+
+        for cid, state in state_by_id.items():
+            if state["status"] == "completed" and int(state.get("record_count") or 0) != history_counts.get(cid, 0):
+                issues.append({
+                    "code": "history_count_mismatch",
+                    "catalog_id": cid,
+                    "fetch_state_record_count": int(state.get("record_count") or 0),
+                    "actual_record_count": history_counts.get(cid, 0)
+                })
+            if state["status"] == "failed_no_auto_retry" and history_counts.get(cid, 0):
+                issues.append({"code": "failed_fetch_has_history_records", "catalog_id": cid})
+
+        offline_keys = set()
+        offline_source_counts = {}
+        for row in offline_rows:
+            cid = int(row["catalog_id"])
+            epoch = str(row["epoch_utc"])
+            source = str(row["source"])
+            key = (cid, epoch, source)
+            if key in offline_keys:
+                issues.append({"code": "duplicate_offline_key", "catalog_id": cid, "epoch_utc": epoch, "source": source})
+            offline_keys.add(key)
+            offline_source_counts[source] = offline_source_counts.get(source, 0) + 1
+            try:
+                payload = json.loads(row["payload_json"])
+                payload_id = int(payload.get("NORAD_CAT_ID", payload.get("NORAD_CATID", 0)))
+                payload_epoch = as_utc(datetime.fromisoformat(str(payload["EPOCH"]).replace("Z", "+00:00"))).isoformat()
+                stored_epoch = as_utc(datetime.fromisoformat(epoch.replace("Z", "+00:00"))).isoformat()
+                imported = datetime.fromisoformat(str(row["imported_at_utc"]).replace("Z", "+00:00"))
+                if payload_id != cid or payload_epoch != stored_epoch:
+                    issues.append({"code": "offline_payload_metadata_mismatch", "catalog_id": cid, "epoch_utc": epoch, "source": source})
+                if imported.tzinfo is None:
+                    issues.append({"code": "offline_import_timestamp_missing_timezone", "catalog_id": cid, "epoch_utc": epoch})
+            except Exception as exc:
+                issues.append({"code": "invalid_offline_payload_or_timestamp", "catalog_id": cid, "epoch_utc": epoch, "source": source, "error": str(exc)[:120]})
+
+        cross_source_overlap = sorted(
+            [{"catalog_id": cid, "epoch_utc": epoch}
+             for cid, epoch in {(x[0], x[1]) for x in history_keys} &
+                                {(x[0], x[1]) for x in offline_keys}],
+            key=lambda x: (x["catalog_id"], x["epoch_utc"])
+        )
+        if cross_source_overlap:
+            warnings.append({
+                "code": "same_catalog_epoch_in_separate_archives",
+                "count": len(cross_source_overlap),
+                "note": "GP_HISTORY and offline imports are stored separately; overlap is informational and is not treated as a duplicate."
+            })
+
+        return {
+            "api_version": APP_VERSION,
+            "status": "passed" if not issues else "issues_found",
+            "audit_scope": "all_archive_tables",
+            "counts": {
+                "fetch_states": len(states),
+                "gp_history_records": len(history_rows),
+                "offline_omm_records": len(offline_rows),
+                "offline_sources": offline_source_counts
+            },
+            "checks": {
+                "fetch_state_statuses": "passed" if not any(x["code"] == "unknown_fetch_status" for x in issues) else "failed",
+                "gp_history_payload_metadata": "passed" if not any(x["code"] in ("history_payload_metadata_mismatch", "invalid_history_payload") for x in issues) else "failed",
+                "gp_history_fetch_state_consistency": "passed" if not any(x["code"] in ("history_record_without_completed_fetch", "history_count_mismatch", "failed_fetch_has_history_records") for x in issues) else "failed",
+                "offline_payload_metadata": "passed" if not any(x["code"] in ("offline_payload_metadata_mismatch", "invalid_offline_payload_or_timestamp") for x in issues) else "failed",
+                "duplicate_keys": "passed" if not any("duplicate" in x["code"] for x in issues) else "failed"
+            },
+            "issues": issues,
+            "warnings": warnings,
+            "database_modified": False,
+            "gp_history_requested": False,
+            "note": "Read-only audit. It does not modify PostgreSQL, call Space-Track, or establish independent orbital accuracy."
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "status": "audit_unavailable",
+            "error": str(exc)[:200],
+            "database_modified": False,
             "gp_history_requested": False
         }) from exc
 

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import math
 import os
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -420,6 +422,67 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok", "version": APP_VERSION, "atmosphere_model": "NRLMSISE-00"}
+
+
+@app.get("/api/v1/tle/{norad_id}")
+def get_latest_tle(norad_id: int):
+    """Fetch and validate the latest public GP TLE from CelesTrak by NORAD catalog ID."""
+    if not 1 <= norad_id <= 999999:
+        raise HTTPException(status_code=422, detail="NORAD Catalog ID ต้องอยู่ระหว่าง 1–999999")
+
+    url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle"
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Thai-Reentry-Predictor/5.0 (educational research tool)"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"CelesTrak ตอบกลับ HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"ติดต่อ CelesTrak ไม่สำเร็จ: {exc}") from exc
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    name, line1, line2 = None, None, None
+    for i, line in enumerate(lines):
+        if line.startswith("1 ") and i + 1 < len(lines) and lines[i + 1].startswith("2 "):
+            candidate1, candidate2 = line, lines[i + 1]
+            try:
+                catalog1 = int(candidate1[2:7])
+                catalog2 = int(candidate2[2:7])
+            except (ValueError, IndexError):
+                continue
+            if catalog1 == norad_id and catalog2 == norad_id:
+                name = lines[i - 1] if i > 0 and not lines[i - 1].startswith(("1 ", "2 ")) else f"NORAD {norad_id}"
+                line1, line2 = candidate1, candidate2
+                break
+
+    if not line1 or not line2:
+        raise HTTPException(status_code=404, detail=f"ไม่พบ GP TLE สำหรับ NORAD {norad_id}")
+
+    if not tle_checksum_ok(line1) or not tle_checksum_ok(line2):
+        raise HTTPException(status_code=502, detail="CelesTrak ส่ง TLE ที่ checksum ไม่ถูกต้อง")
+
+    epoch_field = line1[18:32]
+    try:
+        yy = int(epoch_field[:2])
+        year = 1900 + yy if yy >= 57 else 2000 + yy
+        day_of_year = float(epoch_field[2:])
+        epoch = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=day_of_year - 1)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail="ไม่สามารถอ่าน TLE Epoch ได้") from exc
+
+    return {
+        "norad_id": norad_id,
+        "name": name,
+        "line1": line1,
+        "line2": line2,
+        "epoch_utc": epoch.isoformat(),
+        "source": "CelesTrak GP",
+        "source_url": url,
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.post("/api/v1/atmosphere")

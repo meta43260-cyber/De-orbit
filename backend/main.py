@@ -876,13 +876,15 @@ def get_omm_history(catalog_id: int, limit: int = 20):
 
                 # Store all records and mark completion in one database transaction.
                 with conn.transaction():
-                    conn.executemany(
-                        """INSERT INTO omm_history_records
-                           (catalog_id,epoch_utc,creation_date,source,payload_json)
-                           VALUES(%s,%s,%s,%s,%s)
-                           ON CONFLICT (catalog_id,epoch_utc) DO NOTHING""",
-                        saved
-                    )
+                    # psycopg 3 exposes executemany() on Cursor, not Connection.
+                    with conn.cursor() as cur:
+                        cur.executemany(
+                            """INSERT INTO omm_history_records
+                               (catalog_id,epoch_utc,creation_date,source,payload_json)
+                               VALUES(%s,%s,%s,%s,%s)
+                               ON CONFLICT (catalog_id,epoch_utc) DO NOTHING""",
+                            saved
+                        )
                     conn.execute(
                         """UPDATE omm_history_fetches
                            SET status=%s,completed_at_utc=%s,record_count=%s,error=NULL

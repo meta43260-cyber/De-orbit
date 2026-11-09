@@ -6,6 +6,7 @@ This is an educational/research prototype, not an operational re-entry forecast.
 from __future__ import annotations
 
 import math
+import json
 import os
 import urllib.error
 import urllib.request
@@ -437,24 +438,49 @@ def get_latest_tle(norad_id: int):
     ]
     headers = {"User-Agent": "Thai-Reentry-Predictor/5.0 (educational research tool)"}
     raw = None
+    source = "CelesTrak GP"
+    source_url = None
     last_error = None
-    # Keep the mobile-facing request bounded: at most 8 seconds per hostname.
+
+    # Try the primary source first, with a short timeout per hostname.
     for url in urls:
-        request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=6) as response:
                 raw = response.read().decode("utf-8", errors="replace")
+            source_url = url
             break
         except urllib.error.HTTPError as exc:
-            raise HTTPException(status_code=502, detail=f"CelesTrak ตอบกลับ HTTP {exc.code}") from exc
+            last_error = f"HTTP {exc.code} from {url}"
         except Exception as exc:
-            last_error = exc
+            last_error = str(exc)
+
+    # Fallback: community TLE API mirror (its catalog is updated daily from CelesTrak).
+    # Keep source and element epoch visible to clients; never present this as a direct CelesTrak fetch.
     if raw is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"CelesTrak ยังไม่ตอบสนองหลังทดลอง 2 hostname: {last_error}. "
-                   "คำขอถูกยุติเพื่อไม่ให้หน้าเว็บค้าง โปรดลองใหม่ภายหลัง",
-        )
+        fallback_url = f"https://tle.ivanstanojevic.me/api/tle/{norad_id}"
+        try:
+            request = urllib.request.Request(fallback_url, headers=headers)
+            with urllib.request.urlopen(request, timeout=8) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            if int(payload.get("satelliteId", payload.get("satellite_id", norad_id))) != norad_id:
+                raise ValueError("Fallback API returned a different NORAD ID")
+            line1 = payload.get("line1")
+            line2 = payload.get("line2")
+            if not line1 or not line2:
+                raise ValueError("Fallback API response did not contain line1 and line2")
+            raw = "\\n".join([
+                str(payload.get("name") or f"NORAD {norad_id}"),
+                line1,
+                line2,
+            ])
+            source = "TLE API mirror (daily CelesTrak-derived data)"
+            source_url = fallback_url
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"ดึง TLE ไม่สำเร็จจาก CelesTrak และแหล่งสำรอง: {last_error}; fallback: {exc}",
+            ) from exc
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     name, line1, line2 = None, None, None
@@ -475,7 +501,7 @@ def get_latest_tle(norad_id: int):
         raise HTTPException(status_code=404, detail=f"ไม่พบ GP TLE สำหรับ NORAD {norad_id}")
 
     if not tle_checksum_ok(line1) or not tle_checksum_ok(line2):
-        raise HTTPException(status_code=502, detail="CelesTrak ส่ง TLE ที่ checksum ไม่ถูกต้อง")
+        raise HTTPException(status_code=502, detail=f"{source} ส่ง TLE ที่ checksum ไม่ถูกต้อง")
 
     epoch_field = line1[18:32]
     try:
@@ -492,8 +518,8 @@ def get_latest_tle(norad_id: int):
         "line1": line1,
         "line2": line2,
         "epoch_utc": epoch.isoformat(),
-        "source": "CelesTrak GP",
-        "source_url": url,
+        "source": source,
+        "source_url": source_url,
         "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 

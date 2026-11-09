@@ -819,16 +819,25 @@ def get_latest_omm(catalog_id: int):
 
     # Keep diagnostics in a stable GP/SupGP order.
     status_by_source = {item["source"]: item for item in statuses}
-    statuses = [status_by_source.get(spec[0], {
-        "source": spec[0], "status": "error", "error": "no response before deadline",
-        "latency_ms": 22000, "relationship": spec[2]
-    }) for spec in specs]
+    # Preserve Space-Track diagnostics; the previous ordering accidentally
+    # dropped this source from the response even though it had been queried.
+    statuses = [
+        status_by_source.get("Space-Track GP", {
+            "source": "Space-Track GP", "status": "error",
+            "error": "no response from Space-Track", "latency_ms": None,
+            "relationship": "Space-Track GP",
+        }),
+        *[status_by_source.get(spec[0], {
+            "source": spec[0], "status": "error", "error": "no response before deadline",
+            "latency_ms": 22000, "relationship": spec[2]
+        }) for spec in specs],
+    ]
 
     if not candidates:
         raise HTTPException(status_code=503, detail={
             "message": f"ไม่พบ OMM ที่ผ่านการตรวจสอบสำหรับ Catalog ID {catalog_id}",
             "sources_checked": statuses,
-            "hint": "ตรวจสอบการเชื่อมต่อขาออกจาก Render ไปยัง CelesTrak; GP และ SupGP เป็นบริการผู้ให้บริการเดียวกัน",
+            "hint": "ตรวจสอบสถานะ Space-Track GP และการเชื่อมต่อขาออกจาก Render ไปยัง CelesTrak; หาก Space-Track ล้มเหลวให้ดู error ของแหล่งนั้นโดยตรง",
         })
     candidates.sort(key=lambda x: x["epoch_timestamp"], reverse=True)
     selected = candidates[0]

@@ -227,6 +227,7 @@ let watchlist=[];try{watchlist=JSON.parse(localStorage.getItem('reentry_watch'))
 let summaries={},lastWeather={kp:null};
 let curNorad=localStorage.getItem('lastNorad')||'25544';
 let map=null,orbitGroup=null,decayChart=null,probChart=null,tileFailed=false,lastMapObj=null;
+let simMap=null,simLayer=null;
 let refreshing=false,pendingRefresh=false,lastManual=0;
 function saveWatch(){try{localStorage.setItem('reentry_watch',JSON.stringify(watchlist.slice(0,10)));}catch(e){}}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
@@ -257,6 +258,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   if(!watchlist.includes(curNorad))watchlist.push(curNorad);
   saveWatch();
   document.getElementById('noradInput').value=curNorad;
+  const apiField=document.getElementById('apiBaseUrl');if(apiField)apiField.value=localStorage.getItem('reentryApiBase')||'';
   map=L.map('map').setView([10,100],3);
   const esri=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{attribution:'Tiles © Esri',maxZoom:18}).addTo(map);
   esri.on('tileerror',()=>{if(!tileFailed){tileFailed=true;map.removeLayer(esri);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:18}).addTo(map);}});
@@ -408,8 +410,10 @@ function drawMap(res,p){
     const t=res.latest;
     const rec=satellite.twoline2satrec(t.line1,t.line2);
     const now=Date.now(),pts=[];let cur=null;
-    for(let i=0;i<288;i++){
-      const tm=new Date(now+i*300000);
+    // 30-second SGP4 sampling: denser computed positions, not cosmetic curve smoothing.
+    const STEP_MS=30*1000,MAX_POINTS=2880;
+    for(let i=0;i<MAX_POINTS;i++){
+      const tm=new Date(now+i*STEP_MS);
       try{
         const pv=satellite.propagate(rec,tm);
         if(!pv.position)break;
@@ -503,12 +507,161 @@ function submitActual(){
   toast(n?'บันทึกแล้ว '+n+' การพยากรณ์ของ NORAD '+id:'ไม่พบรายการรอผลของ NORAD '+id,true);
 }
 window.recordActualReentry=function(id,dateStr){const n=LS.recordActual(id,new Date(dateStr).getTime());renderLearning();return n;};
+
+function renderSimulationMap(track, impact){
+  if(!simMap){
+    simMap=L.map('simulationMap').setView([0,0],2);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:18}).addTo(simMap);
+    simLayer=L.layerGroup().addTo(simMap);
+  }
+  simLayer.clearLayers();
+  const segments=[];let current=[];
+  for(const p of track){
+    const point=[Number(p.latitude_deg),Number(p.longitude_deg)];
+    if(!Number.isFinite(point[0])||!Number.isFinite(point[1]))continue;
+    if(current.length&&Math.abs(point[1]-current[current.length-1][1])>180){if(current.length>1)segments.push(current);current=[point];}
+    else current.push(point);
+  }
+  if(current.length>1)segments.push(current);
+  const lines=[];
+  for(const seg of segments)lines.push(L.polyline(seg,{color:'#f97316',weight:3,opacity:.9}).addTo(simLayer));
+  if(impact&&track.length){
+    const last=track[track.length-1];
+    L.circleMarker([last.latitude_deg,last.longitude_deg],{radius:8,color:'#fff',weight:2,fillColor:'#ef4444',fillOpacity:1})
+      .bindPopup('Modelled ground intersection').addTo(simLayer);
+  }
+  if(lines.length){
+    const group=L.featureGroup(lines);
+    simMap.fitBounds(group.getBounds().pad(0.12));
+  }else if(track.length){
+    const p=track[track.length-1];simMap.setView([p.latitude_deg,p.longitude_deg],4);
+  }
+  setTimeout(()=>simMap.invalidateSize(),120);
+}
+
+
+// ---------- CLOUD TLE ACQUISITION ----------
+let cloudTle = null;
+function setCloudTleInfo(message, color='text-gray-300'){
+  const el=document.getElementById('cloudTleInfo');
+  if(el){el.textContent=message;el.className='text-xs '+color;}
+}
+function tleAgeLabel(epoch){
+  const hours=(Date.now()-new Date(epoch).getTime())/HOUR;
+  if(!Number.isFinite(hours))return 'อ่าน Epoch ไม่ได้';
+  const age=hours<0?'Epoch อยู่ในอนาคต':hours<24?hours.toFixed(1)+' ชั่วโมง':(hours/24).toFixed(1)+' วัน';
+  return age;
+}
+async function fetchCloudTLE(){
+  const btn=document.getElementById('fetchCloudTleBtn');
+  const status=document.getElementById('simRunStatus');
+  const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
+  const id=String(document.getElementById('cloudNoradInput').value||document.getElementById('noradInput').value||curNorad||'').trim();
+  try{
+    if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
+    if(!/^\d{1,6}$/.test(id)||Number(id)<1)throw new Error('กรุณากรอก NORAD ID ตั้งแต่ 1 ถึง 999999');
+    localStorage.setItem('reentryApiBase',base);
+    btn.disabled=true;btn.classList.add('opacity-50');
+    setCloudTleInfo('กำลังติดต่อ Backend… หาก Render เพิ่งพักบริการ อาจใช้เวลาเริ่มระบบ 30–60 วินาที','text-yellow-300');
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),90000);
+    let response;
+    try{response=await fetch(base+'/api/v1/tle/'+encodeURIComponent(id),{method:'GET',headers:{'Accept':'application/json'},signal:controller.signal});}
+    finally{clearTimeout(timer);}
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.detail||('Backend ตอบ HTTP '+response.status));
+    if(Number(data.norad_id)!==Number(id)||!validTLE(data.line1,data.line2,id))throw new Error('TLE ที่ได้รับไม่ผ่านการตรวจสอบ NORAD ID หรือ checksum');
+    const epochMs=new Date(data.epoch_utc).getTime();
+    if(!Number.isFinite(epochMs))throw new Error('Backend ส่ง Epoch ที่อ่านไม่ได้');
+    cloudTle={norad_id:Number(id),name:data.name||('NORAD '+id),line1:data.line1,line2:data.line2,epoch:epochMs,epoch_utc:data.epoch_utc,source:data.source||'ไม่ระบุ',source_url:data.source_url||'',fetched_at_utc:data.fetched_at_utc||new Date().toISOString()};
+    document.getElementById('cloudNoradInput').value=id;
+    const ageHours=(Date.now()-epochMs)/HOUR;
+    const freshness=ageHours>72?'ข้อมูลเก่ากว่า 72 ชั่วโมง — ควรตรวจสอบก่อนจำลอง':ageHours>24?'ข้อมูลเก่ากว่า 24 ชั่วโมง':'ข้อมูลค่อนข้างใหม่';
+    const color=ageHours>72?'text-red-300':ageHours>24?'text-yellow-300':'text-green-300';
+    setCloudTleInfo('✓ '+cloudTle.name+' (#'+id+') · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+' · '+cloudTle.source+' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness,color);
+    status.textContent='รับ TLE แล้ว — พร้อมส่งเข้าแบบจำลอง';
+    status.className='text-xs text-green-300';
+  }catch(err){
+    cloudTle=null;
+    const msg=err.name==='AbortError'?'หมดเวลารอ Backend (90 วินาที) — ตรวจสอบ Render ว่าบริการทำงานอยู่':err.message;
+    setCloudTleInfo('ดึง TLE ไม่สำเร็จ: '+msg,'text-red-300');
+    status.textContent='ดึง TLE ไม่สำเร็จ: '+msg;
+    status.className='text-xs text-red-300';
+  }finally{
+    btn.disabled=false;btn.classList.remove('opacity-50');
+  }
+}
+window.fetchCloudTLE=fetchCloudTLE;
+
+async function runCloudSimulation(){
+  const btn=document.getElementById('runSimulationBtn');
+  const status=document.getElementById('simRunStatus');
+  btn.disabled=true;btn.classList.add('opacity-50');
+  try{
+    const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
+    if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
+    localStorage.setItem('reentryApiBase',base);
+    if(!cloudTle)throw new Error('กรุณากรอก NORAD ID แล้วกด “ดึง TLE” ก่อนเริ่มจำลอง');
+    const number=id=>Number(document.getElementById(id).value);
+    const payload={
+      tle_line1:cloudTle.line1,
+      tle_line2:cloudTle.line2,
+      start_time_utc:new Date().toISOString(),
+      max_search_hours:168,
+      max_simulation_seconds:1800,
+      sample_interval_s:2,
+      mass_kg:number('simMass'),
+      reference_area_m2:number('simArea'),
+      drag_coefficient:number('simCd'),
+      nose_radius_m:number('simNose'),
+      f107_sfu:number('simF107'),
+      f107a_sfu:number('simF107a'),
+      ap:number('simAp')
+    };
+    for(const k of ['mass_kg','reference_area_m2','drag_coefficient','nose_radius_m','f107_sfu','f107a_sfu','ap']){
+      if(!Number.isFinite(payload[k]))throw new Error('กรุณาตรวจสอบค่าพารามิเตอร์การจำลอง');
+    }
+    status.textContent='กำลังส่ง TLE ของ '+cloudTle.name+' (#'+cloudTle.norad_id+') ไปยัง Cloud และคำนวณ…';
+    const controller=new AbortController();
+    const timer=setTimeout(()=>controller.abort(),180000);
+    let response;
+    try{response=await fetch(base+'/api/v1/simulate',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),signal:controller.signal
+    });}finally{clearTimeout(timer);}
+    const data=await response.json().catch(()=>({}));
+    if(!response.ok)throw new Error(data.detail||('HTTP '+response.status));
+    const track=data.track||[];
+    const last=track.length?track[track.length-1]:null;
+    document.getElementById('simStatus').textContent=data.status||'-';
+    document.getElementById('simElapsed').textContent=(Number(data.elapsed_simulation_s||0)/60).toFixed(1)+' นาที';
+    document.getElementById('simPeakQ').textContent=(Number(data.peak_dynamic_pressure_Pa||0)/1000).toFixed(2)+' kPa';
+    document.getElementById('simPeakHeat').textContent=(Number(data.peak_convective_heat_flux_W_m2||0)/1e6).toFixed(3)+' MW/m²';
+    document.getElementById('simPeakDecel').textContent=(Number(data.peak_drag_deceleration_m_s2||0)/9.80665).toFixed(2)+' g';
+    document.getElementById('simImpact').textContent=data.impact&&last
+      ?Number(last.latitude_deg).toFixed(3)+'°, '+Number(last.longitude_deg).toFixed(3)+'°'
+      :'ยังไม่ถึงพื้นในช่วงจำลอง';
+    document.getElementById('simModelNote').textContent=
+      'เริ่มที่ '+Number(data.entry_interface.altitude_km).toFixed(1)+' km · '+data.model.atmosphere+
+      ' · '+track.length+' จุดแสดงผล · '+data.model.integration;
+    renderSimulationMap(track,!!data.impact);
+    status.textContent='จำลองเสร็จแล้ว — '+cloudTle.name+' (#'+cloudTle.norad_id+') · ตรวจสอบข้อจำกัดและสมมติฐานก่อนตีความผล';
+    status.className='text-xs text-green-300';
+  }catch(err){
+    status.textContent='ไม่สำเร็จ: '+(err.name==='AbortError'?'หมดเวลารอผลจำลอง (180 วินาที)':err.message);
+    status.className='text-xs text-red-300';
+  }finally{
+    btn.disabled=false;btn.classList.remove('opacity-50');
+  }
+}
+window.runCloudSimulation=runCloudSimulation;
+
 function showTab(name,btn){
   document.querySelectorAll('.tab-content').forEach(el=>el.classList.add('hidden'));
   document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('tab-active'));
   document.getElementById('tab-'+name).classList.remove('hidden');
   btn.classList.add('tab-active');
   if(name==='map')setTimeout(()=>map.invalidateSize(),100);
+  if(name==='simulation'&&simMap)setTimeout(()=>simMap.invalidateSize(),150);
   if(name==='decay'){if(decayChart)decayChart.resize();if(probChart)probChart.resize();}
 }
 function clearLearningData(){if(confirm('ล้างสถิติและบันทึกผลทั้งหมด?')){LS.clear();renderLearning();}}

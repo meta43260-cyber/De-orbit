@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#0c1445">
-<title>Thai Re-entry Predictor v4</title>
+<title>Thai Re-entry Predictor v5.0 Cloud Alpha</title>
 <script src="https://cdn.tailwindcss.com/3.4.17"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -30,7 +30,7 @@ body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-
       <div class="w-12 h-12 bg-blue-500 rounded-full flex items-center justify-center pulse text-2xl">🛰️</div>
       <div>
         <h1 class="text-xl font-bold neon">Re-entry Predictor</h1>
-        <p class="text-xs text-blue-200">v4 | <span id="status" class="text-yellow-400">กำลังโหลด...</span></p>
+        <p class="text-xs text-blue-200">v5.0 Cloud Alpha | <span id="status" class="text-yellow-400">กำลังโหลด...</span></p>
       </div>
     </div>
     <button onclick="refreshAll(true)" aria-label="อัปเดตข้อมูล" class="glass px-3 py-2 rounded-lg text-sm">🔄</button>
@@ -87,6 +87,7 @@ body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-
     <button onclick="showTab('decay',this)" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📉 กราฟ</button>
     <button onclick="showTab('details',this)" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📊 รายละเอียด</button>
     <button onclick="showTab('learning',this)" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">📈 บันทึกผลจริง</button>
+    <button onclick="showTab('simulation',this)" class="tab-btn glass px-4 py-2 rounded-lg text-sm whitespace-nowrap">🚀 จำลอง Re-entry</button>
   </div>
 
   <div id="tab-map" class="tab-content">
@@ -140,6 +141,77 @@ body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-
         <p class="text-gray-400 text-center py-8">ยังไม่มีข้อมูล</p>
       </div>
       <button onclick="clearLearningData()" class="mt-3 w-full glass px-4 py-2 rounded-lg text-sm text-red-400">🗑️ ล้างสถิติและบันทึกผล</button>
+    </section>
+  </div>
+
+  <div id="tab-simulation" class="tab-content hidden">
+    <section class="glass rounded-xl p-4 space-y-3">
+      <div>
+        <h3 class="font-semibold">🚀 Cloud Re-entry Simulation</h3>
+        <p class="text-xs text-gray-400 mt-1">ใช้ TLE ล่าสุดของ NORAD ที่กำลังเลือกอยู่ ส่งไปคำนวณบน Cloud ด้วย SGP4 + NRLMSISE-00</p>
+      </div>
+      <label class="block text-xs text-gray-300">Backend API URL (Render)</label>
+      <input id="apiBaseUrl" type="url" placeholder="https://your-service.onrender.com" class="w-full bg-gray-800 rounded-lg p-2 text-white text-sm">
+      <p class="text-xs text-gray-500">ใส่ URL หลัง Deploy Backend สำเร็จ เช่น https://thai-reentry-predictor-api.onrender.com</p>
+      <div class="rounded-lg border border-blue-400/30 bg-blue-950/40 p-3 space-y-2">
+        <h4 class="text-sm font-semibold text-blue-200">📡 ดึง TLE ล่าสุดอัตโนมัติ</h4>
+        <div class="flex gap-2">
+          <input id="cloudNoradInput" type="number" inputmode="numeric" min="1" max="999999" placeholder="NORAD ID เช่น 25544" class="min-w-0 flex-1 bg-gray-800 rounded-lg p-2 text-white text-sm">
+          <button id="fetchCloudTleBtn" onclick="fetchCloudTLE()" class="bg-blue-600 px-3 py-2 rounded-lg text-sm whitespace-nowrap">ดึง TLE</button>
+        </div>
+        <div id="cloudTleInfo" class="text-xs text-gray-300" aria-live="polite">ยังไม่ได้ดึง TLE จาก Backend</div>
+        <p class="text-xs text-gray-500">ข้อมูลจะถูกตรวจสอบ checksum และ Epoch ก่อนนำไปจำลอง ไม่ต้องคัดลอก TLE เอง</p>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <label class="text-xs text-gray-300">มวลวัตถุ (kg)
+          <input id="simMass" type="number" min="0.01" step="any" value="500" class="w-full bg-gray-800 rounded-lg p-2 mt-1 text-white">
+        </label>
+        <label class="text-xs text-gray-300">พื้นที่หน้าตัด (m²)
+          <input id="simArea" type="number" min="0.001" step="any" value="10" class="w-full bg-gray-800 rounded-lg p-2 mt-1 text-white">
+        </label>
+        <label class="text-xs text-gray-300">Drag coefficient (Cd)
+          <input id="simCd" type="number" min="0.1" max="5" step="0.1" value="2.2" class="w-full bg-gray-800 rounded-lg p-2 mt-1 text-white">
+        </label>
+        <label class="text-xs text-gray-300">รัศมีหัววัตถุ (m)
+          <input id="simNose" type="number" min="0.001" step="any" value="0.5" class="w-full bg-gray-800 rounded-lg p-2 mt-1 text-white">
+        </label>
+      </div>
+      <div class="grid grid-cols-3 gap-2">
+        <label class="text-xs text-gray-300">F10.7
+          <input id="simF107" type="number" min="50" max="400" value="150" class="w-full bg-gray-800 rounded-lg p-2 mt-1 text-white">
+        </label>
+        <label class="text-xs text-gray-300">F10.7a
+          <input id="simF107a" type="number" min="50" max="400" value="150" class="w-full bg-gray-800 rounded-lg p-2 mt-1 text-white">
+        </label>
+        <label class="text-xs text-gray-300">Ap
+          <input id="simAp" type="number" min="0" max="400" value="15" class="w-full bg-gray-800 rounded-lg p-2 mt-1 text-white">
+        </label>
+      </div>
+      <button id="runSimulationBtn" onclick="runCloudSimulation()" class="w-full bg-gradient-to-r from-blue-600 to-purple-600 rounded-lg py-3 font-semibold text-sm">เริ่มจำลองบน Cloud</button>
+      <p id="simRunStatus" class="text-xs text-yellow-300" aria-live="polite">รอการตั้งค่า Backend URL</p>
+    </section>
+    <section class="glass rounded-xl p-4 mt-4 space-y-3">
+      <h3 class="font-semibold">📍 วิถีการเคลื่อนที่จำลอง</h3>
+      <div id="simulationMap" style="height:320px;border-radius:12px;z-index:1"></div>
+      <div class="grid grid-cols-2 gap-2 text-sm">
+        <div class="bg-white/5 rounded-lg p-2"><div class="text-xs text-gray-400">สถานะ</div><div id="simStatus" class="font-semibold">ยังไม่มีผล</div></div>
+        <div class="bg-white/5 rounded-lg p-2"><div class="text-xs text-gray-400">เวลาจำลอง</div><div id="simElapsed" class="font-semibold">-</div></div>
+        <div class="bg-white/5 rounded-lg p-2"><div class="text-xs text-gray-400">แรงดันพลวัตสูงสุด</div><div id="simPeakQ" class="font-semibold">-</div></div>
+        <div class="bg-white/5 rounded-lg p-2"><div class="text-xs text-gray-400">Heat flux สูงสุด</div><div id="simPeakHeat" class="font-semibold">-</div></div>
+        <div class="bg-white/5 rounded-lg p-2"><div class="text-xs text-gray-400">ความหน่วงสูงสุด</div><div id="simPeakDecel" class="font-semibold">-</div></div>
+        <div class="bg-white/5 rounded-lg p-2"><div class="text-xs text-gray-400">จุดตัดพื้นโดยประมาณ</div><div id="simImpact" class="font-semibold text-xs">ยังไม่มีข้อมูล</div></div>
+      </div>
+      <p id="simModelNote" class="text-xs text-gray-400">ผลจำลองจะปรากฏที่นี่</p>
+    </section>
+    <section class="glass rounded-xl p-4 mt-4">
+      <h3 class="font-semibold mb-2">⚠️ ข้อจำกัดของแบบจำลอง</h3>
+      <ul class="text-xs text-gray-400 list-disc pl-5 space-y-1">
+        <li>จุดเริ่มต้นของ Re-entry มาจากการพยากรณ์ SGP4 ของ TLE ไม่ใช่การวัดตำแหน่งจริง</li>
+        <li>ค่า F10.7, F10.7a และ Ap เริ่มต้นเป็นสมมติฐาน ต้องเปลี่ยนเป็นค่าที่ตรวจสอบได้เมื่อมีข้อมูล</li>
+        <li>มวล พื้นที่หน้าตัด และ Cd คงที่ ยังไม่จำลองการระเหย การแตกตัว หรือการกระจายเศษซาก</li>
+        <li>Heat flux เป็นค่าประมาณ Sutton–Graves ไม่ใช่การคำนวณการรอดของวัสดุ</li>
+        <li>ผลนี้เป็นการจำลองสถานการณ์ ไม่ใช่จุดตกที่ยืนยันแล้ว</li>
+      </ul>
     </section>
   </div>
 

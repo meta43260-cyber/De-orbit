@@ -9,6 +9,7 @@ import math
 import os
 import urllib.error
 import urllib.request
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -430,18 +431,36 @@ def get_latest_tle(norad_id: int):
     if not 1 <= norad_id <= 999999:
         raise HTTPException(status_code=422, detail="NORAD Catalog ID ต้องอยู่ระหว่าง 1–999999")
 
-    url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle"
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Thai-Reentry-Predictor/5.0 (educational research tool)"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            raw = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"CelesTrak ตอบกลับ HTTP {exc.code}") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"ติดต่อ CelesTrak ไม่สำเร็จ: {exc}") from exc
+    urls = [
+        f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle",
+        f"https://www.celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle",
+    ]
+    headers = {"User-Agent": "Thai-Reentry-Predictor/5.0 (educational research tool)"}
+    raw = None
+    last_error = None
+    # Retry transient network failures and try the www hostname as a fallback.
+    for url in urls:
+        request = urllib.request.Request(url, headers=headers)
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=25) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
+                break
+            except urllib.error.HTTPError as exc:
+                # An HTTP response means the host was reached; do not hide server errors.
+                raise HTTPException(status_code=502, detail=f"CelesTrak ตอบกลับ HTTP {exc.code}") from exc
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(1.5)
+        if raw is not None:
+            break
+    if raw is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ติดต่อ CelesTrak ไม่สำเร็จหลังลองหลายครั้ง: {last_error}. "
+                   "โปรดลองใหม่ภายหลัง หรือใช้ TLE จากแหล่งสำรอง",
+        )
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
     name, line1, line2 = None, None, None

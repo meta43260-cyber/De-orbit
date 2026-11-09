@@ -27,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.5.0-sgp4-validation"
+APP_VERSION = "5.6.0-scientific-validation"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -86,6 +86,14 @@ class SGP4ValidationRequest(BaseModel):
     omm_fields: dict
     tle_line1: Optional[str] = None
     tle_line2: Optional[str] = None
+
+class LongTermValidationRequest(BaseModel):
+    omm_fields: dict
+    offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0], min_length=1, max_length=12)
+
+
+class BatchValidationRequest(BaseModel):
+    catalog_ids: list[int] = Field(min_length=1, max_length=8)
 
 
 def as_utc(value: datetime) -> datetime:
@@ -1027,6 +1035,110 @@ def validate_sgp4(req: SGP4ValidationRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"SGP4 validation failed: {exc}") from exc
+
+
+
+@app.post("/api/v1/validate/long-term")
+def validate_long_term(req: LongTermValidationRequest):
+    """Stress-test SGP4 propagation at longer offsets; not an independent accuracy validation."""
+    try:
+        fields = {str(k).upper(): v for k, v in req.omm_fields.items()}
+        required = ("NORAD_CAT_ID", "EPOCH", "MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
+                    "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY")
+        missing = [key for key in required if fields.get(key) in (None, "")]
+        if missing:
+            raise HTTPException(status_code=422, detail={"message": "OMM fields missing", "fields": missing})
+        catalog_id = int(fields["NORAD_CAT_ID"])
+        if not 1 <= catalog_id <= 999999:
+            raise HTTPException(status_code=422, detail="OMM NORAD_CAT_ID is outside 1–999999")
+        epoch = as_utc(datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00")))
+        fields["EPOCH"] = epoch.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        fields.setdefault("OBJECT_ID", "0000-00A")
+        fields.setdefault("CLASSIFICATION_TYPE", "U")
+        fields.setdefault("EPHEMERIS_TYPE", 0)
+        fields.setdefault("ELEMENT_SET_NO", 0)
+        fields.setdefault("REV_AT_EPOCH", 0)
+        fields.setdefault("BSTAR", 0.0)
+        fields.setdefault("MEAN_MOTION_DOT", 0.0)
+        fields.setdefault("MEAN_MOTION_DDOT", 0.0)
+        sat = Satrec()
+        initialize_omm(sat, fields)
+        if sat.error:
+            raise ValueError(SGP4_ERRORS.get(sat.error, "SGP4 OMM initialization error"))
+        offsets = sorted(set(float(x) for x in req.offsets_hours))
+        if any(not math.isfinite(x) or x < 0 or x > 168 for x in offsets):
+            raise HTTPException(status_code=422, detail="offsets_hours ต้องอยู่ระหว่าง 0 ถึง 168 ชั่วโมง")
+        samples = []
+        for offset in offsets:
+            when = epoch + timedelta(hours=offset)
+            jd, fr = julian_parts(when)
+            error, pos, vel = sat.sgp4(jd, fr)
+            item = {"offset_hours": offset, "time_utc": when.isoformat()}
+            if error:
+                item.update({"status": "error", "error_code": int(error),
+                             "error": SGP4_ERRORS.get(error, "SGP4 propagation error")})
+            else:
+                item.update({"status": "ok", "position_teme_km": list(pos),
+                             "velocity_teme_km_s": list(vel),
+                             "geocentric_radius_km": float(np.linalg.norm(pos))})
+            samples.append(item)
+        all_ok = all(x["status"] == "ok" for x in samples)
+        return {
+            "api_version": APP_VERSION, "catalog_id": catalog_id, "epoch_utc": epoch.isoformat(),
+            "validation": "passed" if all_ok else "failed",
+            "test_type": "long_term_sgp4_numerical_propagation",
+            "samples": samples,
+            "interpretation": "การคำนวณสำเร็จแสดงเพียงว่า SGP4 สามารถ propagate ถึงเวลาที่ทดสอบได้ ไม่ได้ยืนยันว่าตำแหน่งจริงแม่นยำในระยะยาว",
+            "limitations": [
+                "ทุก sample เป็นการ propagate จาก OMM ชุดเดียวกัน ไม่ใช่การเทียบกับการสังเกตอิสระ",
+                "ความคลาดเคลื่อนของวงโคจรและความไม่แน่นอนของ TLE/OMM จะเพิ่มตามเวลา",
+                "ผล TEME ไม่ใช่พิกัดภาคพื้นดิน และ geocentric_radius_km ไม่ใช่ geodetic altitude",
+                "ไม่ใช้ endpoint นี้ทำนายจุดตกหรือรับรองความแม่นยำของ re-entry",
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Long-term SGP4 validation failed: {exc}") from exc
+
+
+@app.post("/api/v1/validate/batch")
+def validate_batch(req: BatchValidationRequest):
+    """Run the existing OMM/TLE consistency validation for up to eight catalog IDs."""
+    if len(set(req.catalog_ids)) != len(req.catalog_ids):
+        raise HTTPException(status_code=422, detail="catalog_ids ต้องไม่มีรหัสซ้ำ")
+    results = []
+    for catalog_id in req.catalog_ids:
+        if not 1 <= catalog_id <= 999999:
+            results.append({"catalog_id": catalog_id, "validation": "rejected",
+                            "error": "Catalog ID ต้องอยู่ในช่วง 1–999999"})
+            continue
+        try:
+            record = get_latest_omm(catalog_id)
+            check = validate_sgp4(SGP4ValidationRequest(
+                omm_fields=record["omm_fields"],
+                tle_line1=(record.get("tle_export") or {}).get("line1"),
+                tle_line2=(record.get("tle_export") or {}).get("line2"),
+            ))
+            results.append({
+                "catalog_id": catalog_id, "name": record.get("name"),
+                "source": record.get("source"), "epoch_utc": record.get("epoch_utc"),
+                "validation": check.get("validation"), "sgp4_initialization": check.get("sgp4_initialization"),
+                "omm_propagation": check.get("omm_propagation"),
+                "tle_export_comparison": check.get("tle_export_comparison"),
+                "samples": check.get("samples"),
+                "limitations": check.get("limitations"),
+            })
+        except Exception as exc:
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            results.append({"catalog_id": catalog_id, "validation": "unavailable", "error": str(detail)[:300]})
+    passed = sum(1 for x in results if x.get("validation") == "passed")
+    return {
+        "api_version": APP_VERSION, "requested_count": len(req.catalog_ids),
+        "passed_count": passed, "failed_or_unavailable_count": len(results) - passed,
+        "results": results,
+        "source_note": "Batch นี้ทดสอบความสอดคล้องของ OMM/TLE จาก catalog feed ไม่ใช่การเทียบกับเครือข่ายติดตามอิสระ",
+    }
 
 
 @app.post("/api/v1/simulate")

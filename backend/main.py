@@ -665,7 +665,7 @@ def _parse_omm_payload(raw: str, catalog_id: int) -> dict:
             raise ValueError(SGP4_ERRORS.get(sat.error, "SGP4 OMM initialization error"))
         tle_lines = None
         if catalog_id <= 99999:
-            _, line1, line2 = export_tle(sat)
+            line1, line2 = export_tle(sat)
             if not tle_checksum_ok(line1) or not tle_checksum_ok(line2):
                 raise ValueError("OMM-to-TLE export failed checksum validation")
             tle_lines = {"line1": line1, "line2": line2}

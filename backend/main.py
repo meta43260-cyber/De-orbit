@@ -762,6 +762,36 @@ def _history_storage_info():
     }
 
 
+@app.get("/api/v1/v6/storage/check")
+def check_v6_storage():
+    """Check PostgreSQL connectivity and initialize archive tables without contacting Space-Track."""
+    try:
+        conn = _history_db()
+        try:
+            row = conn.execute(
+                "SELECT current_database() AS database_name, version() AS server_version"
+            ).fetchone()
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "api_version": APP_VERSION,
+            "status": "connected",
+            "database": "PostgreSQL",
+            "database_name": row["database_name"],
+            "tables_initialized": True,
+            "gp_history_requested": False,
+            "note": "This check does not call Space-Track or consume a GP_HISTORY retrieval."
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "status": "unavailable",
+            "database": "PostgreSQL",
+            "error": str(exc)[:200],
+            "gp_history_requested": False
+        }) from exc
+
+
 @app.get("/api/v1/v6/omm/history/{catalog_id}")
 def get_omm_history(catalog_id: int, limit: int = 20):
     """Fetch GP_HISTORY once per catalog ID, archive in PostgreSQL, then serve cached history."""

@@ -63,7 +63,7 @@ function loadCache(id){try{return JSON.parse(localStorage.getItem(CKEY(id)));}ca
 function saveCache(id,tle){try{localStorage.setItem(CKEY(id),JSON.stringify({t:Date.now(),tle:tle}));}catch(e){}}
 async function fetchTLE(id){
   let tle=null;
-  const apiBase=(localStorage.getItem('reentryApiBase')||'').trim().replace(/\\/+$/,'');
+  const apiBase=(localStorage.getItem('reentryApiBase')||'').trim().replace(/\/+$/,'');
   if(apiBase){
     try{
       const response=await fetch(apiBase+'/api/v1/omm/'+encodeURIComponent(id),{headers:{'Accept':'application/json'}});
@@ -104,7 +104,7 @@ async function fetchTLEHistory(id,days,ttl){
   }
   const all=collectTLE(id,cur);
   const cut=Date.now()-days*DAY;
-  const hist=all.filter(x=>x.epoch>=cut);
+  const hist=all.filter(x=>x.epoch>=cut&&x.line1&&x.line2);
   return{history:hist.length?hist:[cur],latest:cur,source:offline?'offline':'live',count:hist.length};
 }
 async function fetchSpaceWeather(){
@@ -258,7 +258,7 @@ function saveWatch(){try{localStorage.setItem('reentry_watch',JSON.stringify(wat
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function addToWatch(id){
   id=String(parseInt(id,10));
-  if(!id||id==='NaN'||id==='0'){toast('กรอกเลข NORAD 1-99999');return false;}
+  if(!id||id==='NaN'||id==='0'||Number(id)>99999){toast('โมดูลวงโคจรเดิมรองรับ NORAD 1-99999; ID 6 หลักใช้ผ่าน OMM Cloud Simulation');return false;}
   if(watchlist.length>=10&&!watchlist.includes(id)){toast('ติดตามได้สูงสุด 10 วัตถุ');return false;}
   if(!watchlist.includes(id))watchlist.push(id);
   saveWatch();return true;
@@ -580,11 +580,11 @@ function tleAgeLabel(epoch){
 async function fetchCloudTLE(){
   const btn=document.getElementById('fetchCloudTleBtn');
   const status=document.getElementById('simRunStatus');
-  const base=document.getElementById('apiBaseUrl').value.trim().replace(/\\/+$/,'');
+  const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
   const id=String(document.getElementById('cloudNoradInput').value||document.getElementById('noradInput').value||curNorad||'').trim();
   try{
     if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
-    if(!/^\\d{1,6}$/.test(id)||Number(id)<1||Number(id)>999999)throw new Error('Catalog ID ต้องเป็นตัวเลข 1–999999');
+    if(!/^\d{1,6}$/.test(id)||Number(id)<1||Number(id)>999999)throw new Error('Catalog ID ต้องเป็นตัวเลข 1–999999');
     localStorage.setItem('reentryApiBase',base);
     btn.disabled=true;btn.classList.add('opacity-50');
     setCloudTleInfo('กำลังดึง OMM/JSON จากหลายแหล่ง… หาก Render เพิ่งพักบริการ อาจใช้เวลาเริ่มระบบ 30–60 วินาที','text-yellow-300');
@@ -600,7 +600,7 @@ async function fetchCloudTLE(){
     cloudTle={norad_id:Number(id),name:data.name||('CATALOG '+id),line1:ex?ex.line1:null,line2:ex?ex.line2:null,
       omm_fields:data.omm_fields,format:'OMM',epoch:epochMs,epoch_utc:data.epoch_utc,source:data.source||'ไม่ระบุ',
       source_url:data.source_url||'',fetched_at_utc:data.fetched_at_utc||new Date().toISOString()};
-    collectCatalogRecord(id,cloudTle);
+    collectCatalogRecord(id,cloudTle);saveCache(id,cloudTle);
     document.getElementById('cloudNoradInput').value=id;
     const ageHours=(Date.now()-epochMs)/HOUR;
     const freshness=ageHours>72?'ข้อมูลเก่ากว่า 72 ชั่วโมง — ควรตรวจสอบก่อนจำลอง':ageHours>24?'ข้อมูลเก่ากว่า 24 ชั่วโมง':'ข้อมูลค่อนข้างใหม่';
@@ -614,8 +614,8 @@ async function fetchCloudTLE(){
     const detailText='✓ '+cloudTle.name+' (#'+id+') · OMM · '+(ex?'มี TLE export สำหรับระบบเดิม':'Catalog ID 6 หลัก ใช้ OMM โดยตรง')+
       ' · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+
       ' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness+
-      '\\n\\nผลตรวจแหล่งข้อมูล:\\n'+sourceLines.join('\\n')+'\\n\\nชุด OMM ที่ผ่านการตรวจสอบ:\\n'+candidateLines.join('\\n')+
-      '\\n\\nหมายเหตุ: '+(data.source_independence_note||'แหล่งข้อมูลอาจมีต้นทางร่วมกัน');
+      '\n\nผลตรวจแหล่งข้อมูล:\n'+sourceLines.join('\n')+'\n\nชุด OMM ที่ผ่านการตรวจสอบ:\n'+candidateLines.join('\n')+
+      '\n\nหมายเหตุ: '+(data.source_independence_note||'แหล่งข้อมูลอาจมีต้นทางร่วมกัน');
     setCloudTleInfo(detailText,color);
     if(status){status.textContent='รับ OMM แล้ว — บันทึกเข้าประวัติ TLE กลางในเครื่อง และพร้อมจำลองบน Cloud';status.className='text-xs text-green-300';}
   }catch(err){

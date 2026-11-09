@@ -227,6 +227,7 @@ let watchlist=[];try{watchlist=JSON.parse(localStorage.getItem('reentry_watch'))
 let summaries={},lastWeather={kp:null};
 let curNorad=localStorage.getItem('lastNorad')||'25544';
 let map=null,orbitGroup=null,decayChart=null,probChart=null,tileFailed=false,lastMapObj=null;
+let simMap=null,simLayer=null;
 let refreshing=false,pendingRefresh=false,lastManual=0;
 function saveWatch(){try{localStorage.setItem('reentry_watch',JSON.stringify(watchlist.slice(0,10)));}catch(e){}}
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
@@ -257,6 +258,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   if(!watchlist.includes(curNorad))watchlist.push(curNorad);
   saveWatch();
   document.getElementById('noradInput').value=curNorad;
+  const apiField=document.getElementById('apiBaseUrl');if(apiField)apiField.value=localStorage.getItem('reentryApiBase')||'';
   map=L.map('map').setView([10,100],3);
   const esri=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{attribution:'Tiles © Esri',maxZoom:18}).addTo(map);
   esri.on('tileerror',()=>{if(!tileFailed){tileFailed=true;map.removeLayer(esri);L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:18}).addTo(map);}});
@@ -408,8 +410,10 @@ function drawMap(res,p){
     const t=res.latest;
     const rec=satellite.twoline2satrec(t.line1,t.line2);
     const now=Date.now(),pts=[];let cur=null;
-    for(let i=0;i<288;i++){
-      const tm=new Date(now+i*300000);
+    // 30-second SGP4 sampling: denser computed positions, not cosmetic curve smoothing.
+    const STEP_MS=30*1000,MAX_POINTS=2880;
+    for(let i=0;i<MAX_POINTS;i++){
+      const tm=new Date(now+i*STEP_MS);
       try{
         const pv=satellite.propagate(rec,tm);
         if(!pv.position)break;
@@ -503,12 +507,105 @@ function submitActual(){
   toast(n?'บันทึกแล้ว '+n+' การพยากรณ์ของ NORAD '+id:'ไม่พบรายการรอผลของ NORAD '+id,true);
 }
 window.recordActualReentry=function(id,dateStr){const n=LS.recordActual(id,new Date(dateStr).getTime());renderLearning();return n;};
+
+function renderSimulationMap(track, impact){
+  if(!simMap){
+    simMap=L.map('simulationMap').setView([0,0],2);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'© OpenStreetMap',maxZoom:18}).addTo(simMap);
+    simLayer=L.layerGroup().addTo(simMap);
+  }
+  simLayer.clearLayers();
+  const segments=[];let current=[];
+  for(const p of track){
+    const point=[Number(p.latitude_deg),Number(p.longitude_deg)];
+    if(!Number.isFinite(point[0])||!Number.isFinite(point[1]))continue;
+    if(current.length&&Math.abs(point[1]-current[current.length-1][1])>180){if(current.length>1)segments.push(current);current=[point];}
+    else current.push(point);
+  }
+  if(current.length>1)segments.push(current);
+  const lines=[];
+  for(const seg of segments)lines.push(L.polyline(seg,{color:'#f97316',weight:3,opacity:.9}).addTo(simLayer));
+  if(impact&&track.length){
+    const last=track[track.length-1];
+    L.circleMarker([last.latitude_deg,last.longitude_deg],{radius:8,color:'#fff',weight:2,fillColor:'#ef4444',fillOpacity:1})
+      .bindPopup('Modelled ground intersection').addTo(simLayer);
+  }
+  if(lines.length){
+    const group=L.featureGroup(lines);
+    simMap.fitBounds(group.getBounds().pad(0.12));
+  }else if(track.length){
+    const p=track[track.length-1];simMap.setView([p.latitude_deg,p.longitude_deg],4);
+  }
+  setTimeout(()=>simMap.invalidateSize(),120);
+}
+
+async function runCloudSimulation(){
+  const btn=document.getElementById('runSimulationBtn');
+  const status=document.getElementById('simRunStatus');
+  btn.disabled=true;btn.classList.add('opacity-50');
+  try{
+    const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
+    if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
+    localStorage.setItem('reentryApiBase',base);
+    const current=summaries[curNorad];
+    if(!current||!current.res||!current.res.latest)throw new Error('ยังไม่มี TLE ล่าสุด กรุณารอให้หน้าแอปอัปเดตข้อมูลก่อน');
+    const number=id=>Number(document.getElementById(id).value);
+    const payload={
+      tle_line1:current.res.latest.line1,
+      tle_line2:current.res.latest.line2,
+      start_time_utc:new Date().toISOString(),
+      max_search_hours:168,
+      max_simulation_seconds:1800,
+      sample_interval_s:2,
+      mass_kg:number('simMass'),
+      reference_area_m2:number('simArea'),
+      drag_coefficient:number('simCd'),
+      nose_radius_m:number('simNose'),
+      f107_sfu:number('simF107'),
+      f107a_sfu:number('simF107a'),
+      ap:number('simAp')
+    };
+    for(const k of ['mass_kg','reference_area_m2','drag_coefficient','nose_radius_m','f107_sfu','f107a_sfu','ap']){
+      if(!Number.isFinite(payload[k]))throw new Error('กรุณาตรวจสอบค่าพารามิเตอร์การจำลอง');
+    }
+    status.textContent='กำลังส่ง TLE ไปยัง Cloud และคำนวณ… อาจใช้เวลาสักครู่';
+    const response=await fetch(base+'/api/v1/simulate',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)
+    });
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.detail||('HTTP '+response.status));
+    const track=data.track||[];
+    const last=track.length?track[track.length-1]:null;
+    document.getElementById('simStatus').textContent=data.status||'-';
+    document.getElementById('simElapsed').textContent=(Number(data.elapsed_simulation_s||0)/60).toFixed(1)+' นาที';
+    document.getElementById('simPeakQ').textContent=(Number(data.peak_dynamic_pressure_Pa||0)/1000).toFixed(2)+' kPa';
+    document.getElementById('simPeakHeat').textContent=(Number(data.peak_convective_heat_flux_W_m2||0)/1e6).toFixed(3)+' MW/m²';
+    document.getElementById('simPeakDecel').textContent=(Number(data.peak_drag_deceleration_m_s2||0)/9.80665).toFixed(2)+' g';
+    document.getElementById('simImpact').textContent=data.impact&&last
+      ?Number(last.latitude_deg).toFixed(3)+'°, '+Number(last.longitude_deg).toFixed(3)+'°'
+      :'ยังไม่ถึงพื้นในช่วงจำลอง';
+    document.getElementById('simModelNote').textContent=
+      'เริ่มที่ '+Number(data.entry_interface.altitude_km).toFixed(1)+' km · '+data.model.atmosphere+
+      ' · '+track.length+' จุดแสดงผล · '+data.model.integration;
+    renderSimulationMap(track,!!data.impact);
+    status.textContent='จำลองเสร็จแล้ว — ตรวจสอบข้อจำกัดและสมมติฐานก่อนตีความผล';
+    status.className='text-xs text-green-300';
+  }catch(err){
+    status.textContent='ไม่สำเร็จ: '+err.message;
+    status.className='text-xs text-red-300';
+  }finally{
+    btn.disabled=false;btn.classList.remove('opacity-50');
+  }
+}
+window.runCloudSimulation=runCloudSimulation;
+
 function showTab(name,btn){
   document.querySelectorAll('.tab-content').forEach(el=>el.classList.add('hidden'));
   document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('tab-active'));
   document.getElementById('tab-'+name).classList.remove('hidden');
   btn.classList.add('tab-active');
   if(name==='map')setTimeout(()=>map.invalidateSize(),100);
+  if(name==='simulation'&&simMap)setTimeout(()=>simMap.invalidateSize(),150);
   if(name==='decay'){if(decayChart)decayChart.resize();if(probChart)probChart.resize();}
 }
 function clearLearningData(){if(confirm('ล้างสถิติและบันทึกผลทั้งหมด?')){LS.clear();renderLearning();}}

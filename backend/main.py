@@ -20,8 +20,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
+from sgp4.omm import initialize as initialize_omm
+from sgp4.exporter import export_tle
 
-APP_VERSION = "5.1.0-multisource-alpha"
+APP_VERSION = "5.2.0-unified-tle-omm-alpha"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -58,8 +60,9 @@ class AtmosphereRequest(BaseModel):
 
 
 class SimulationRequest(BaseModel):
-    tle_line1: str
-    tle_line2: str
+    tle_line1: Optional[str] = None
+    tle_line2: Optional[str] = None
+    omm_fields: Optional[dict] = None
     start_time_utc: datetime
     entry_time_utc: Optional[datetime] = None
     entry_altitude_km: float = Field(default=ENTRY_ALT_DEFAULT_KM, ge=80, le=150)
@@ -107,6 +110,27 @@ def make_satrec(line1: str, line2: str) -> Satrec:
         return Satrec.twoline2rv(l1, l2, WGS72)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"อ่าน TLE ไม่สำเร็จ: {exc}") from exc
+
+
+def make_satrec_from_request(req: SimulationRequest) -> Satrec:
+    if req.omm_fields:
+        try:
+            fields = {str(k).upper(): v for k, v in req.omm_fields.items()}
+            required = ("NORAD_CAT_ID", "EPOCH", "MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
+                        "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY")
+            missing = [key for key in required if fields.get(key) in (None, "")]
+            if missing:
+                raise ValueError("OMM fields missing: " + ", ".join(missing))
+            sat = Satrec()
+            initialize_omm(sat, fields)
+            if sat.error:
+                raise ValueError(SGP4_ERRORS.get(sat.error, "SGP4 OMM initialization error"))
+            return sat
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"อ่าน OMM ไม่สำเร็จ: {exc}") from exc
+    if req.tle_line1 and req.tle_line2:
+        return make_satrec(req.tle_line1, req.tle_line2)
+    raise HTTPException(status_code=422, detail="ต้องส่งข้อมูล TLE หรือ OMM อย่างใดอย่างหนึ่ง")
 
 
 def julian_parts(when: datetime) -> tuple[float, float]:
@@ -299,7 +323,7 @@ def choose_step(alt_km: float) -> float:
 
 
 def simulate_entry(req: SimulationRequest):
-    sat = make_satrec(req.tle_line1, req.tle_line2)
+    sat = make_satrec_from_request(req)
     entry_time, r0, v0, entry_geo, entry_source = find_entry_state(req, sat)
     y = np.concatenate((r0, v0))
     t = 0.0
@@ -586,6 +610,122 @@ def get_latest_tle(norad_id: int):
         "cache": {"hit": False, "ttl_seconds": _TLE_CACHE_TTL_SECONDS},
     }
     _TLE_SOURCE_CACHE[norad_id] = (now, result)
+    return result
+
+
+
+# OMM catalog feed: accepts five- and six-digit catalog IDs and preserves full OMM fields.
+_OMM_SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
+
+
+def _parse_omm_payload(raw: str, catalog_id: int) -> dict:
+    payload = json.loads(raw)
+    records = payload if isinstance(payload, list) else [payload]
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        fields = {str(k).upper(): v for k, v in record.items()}
+        raw_id = fields.get("NORAD_CAT_ID", fields.get("NORAD_CATID", fields.get("CATALOG_NUMBER")))
+        if raw_id is None or int(raw_id) != catalog_id:
+            continue
+        required = ("EPOCH", "MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
+                    "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY")
+        if any(fields.get(k) in (None, "") for k in required):
+            continue
+        epoch = datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00"))
+        if epoch.tzinfo is None:
+            epoch = epoch.replace(tzinfo=timezone.utc)
+        else:
+            epoch = epoch.astimezone(timezone.utc)
+        numeric = {k: float(fields[k]) for k in required if k != "EPOCH"}
+        if not (0 < numeric["MEAN_MOTION"] < 20 and 0 <= numeric["ECCENTRICITY"] < 1
+                and 0 <= numeric["INCLINATION"] <= 180):
+            raise ValueError("OMM orbital elements are outside accepted ranges")
+        fields["NORAD_CAT_ID"] = str(catalog_id)
+        fields["EPOCH"] = epoch.isoformat().replace("+00:00", "Z")
+        sat = Satrec()
+        initialize_omm(sat, fields)
+        if sat.error:
+            raise ValueError(SGP4_ERRORS.get(sat.error, "SGP4 OMM initialization error"))
+        tle_lines = None
+        if catalog_id <= 99999:
+            _, line1, line2 = export_tle(sat)
+            if not tle_checksum_ok(line1) or not tle_checksum_ok(line2):
+                raise ValueError("OMM-to-TLE export failed checksum validation")
+            tle_lines = {"line1": line1, "line2": line2}
+        return {
+            "catalog_id": catalog_id,
+            "name": str(fields.get("OBJECT_NAME") or fields.get("OBJECT_ID") or f"CATALOG {catalog_id}"),
+            "epoch_utc": epoch.isoformat(),
+            "epoch_timestamp": epoch.timestamp(),
+            "omm_fields": fields,
+            "tle_export": tle_lines,
+            "validation": "passed",
+        }
+    raise ValueError(f"No valid OMM record for catalog ID {catalog_id}")
+
+
+@app.get("/api/v1/omm/{catalog_id}")
+def get_latest_omm(catalog_id: int):
+    """Fetch CelesTrak GP/SupGP OMM JSON and select the newest valid Epoch."""
+    if not 1 <= catalog_id <= 999999:
+        raise HTTPException(status_code=422, detail="Catalog ID ต้องอยู่ในช่วง 1–999999")
+    now = time.time()
+    cached = _OMM_SOURCE_CACHE.get(catalog_id)
+    if cached and now - cached[0] < _TLE_CACHE_TTL_SECONDS:
+        result = dict(cached[1])
+        result["cache"] = {"hit": True, "age_seconds": round(now - cached[0]), "ttl_seconds": _TLE_CACHE_TTL_SECONDS}
+        return result
+
+    headers = {"User-Agent": "Thai-Reentry-Predictor/5.2 (educational research tool)"}
+    specs = [
+        ("CelesTrak GP OMM", f"https://celestrak.org/NORAD/elements/gp.php?CATNR={catalog_id}&FORMAT=json",
+         "CelesTrak GP JSON/OMM"),
+        ("CelesTrak SupGP OMM", f"https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?CATNR={catalog_id}&FORMAT=json",
+         "CelesTrak supplemental; same provider, not an independent tracking network"),
+    ]
+    candidates, statuses = [], []
+    for source, url, relationship in specs:
+        started = time.monotonic()
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=8) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+            item = _parse_omm_payload(raw, catalog_id)
+            item.update({"source": source, "source_url": url, "relationship": relationship,
+                         "latency_ms": round((time.monotonic() - started) * 1000)})
+            candidates.append(item)
+            statuses.append({"source": source, "status": "ok", "epoch_utc": item["epoch_utc"],
+                             "latency_ms": item["latency_ms"], "relationship": relationship})
+        except urllib.error.HTTPError as exc:
+            statuses.append({"source": source, "status": "error", "error": f"HTTP {exc.code}",
+                             "latency_ms": round((time.monotonic() - started) * 1000),
+                             "relationship": relationship})
+        except Exception as exc:
+            statuses.append({"source": source, "status": "error", "error": str(exc)[:240],
+                             "latency_ms": round((time.monotonic() - started) * 1000),
+                             "relationship": relationship})
+
+    if not candidates:
+        raise HTTPException(status_code=503, detail={
+            "message": f"ไม่พบ OMM ที่ผ่านการตรวจสอบสำหรับ Catalog ID {catalog_id}",
+            "sources_checked": statuses,
+        })
+    candidates.sort(key=lambda x: x["epoch_timestamp"], reverse=True)
+    selected = candidates[0]
+    result = {
+        "catalog_id": catalog_id, "norad_id": catalog_id, "format": "OMM",
+        "name": selected["name"], "epoch_utc": selected["epoch_utc"],
+        "omm_fields": selected["omm_fields"], "tle_export": selected["tle_export"],
+        "source": selected["source"], "source_url": selected["source_url"],
+        "selected_source": selected["source"], "selection_method": "newest_valid_epoch",
+        "candidates": [{k: v for k, v in item.items() if k != "epoch_timestamp"} for item in candidates],
+        "sources_checked": statuses,
+        "source_independence_note": "GP and SupGP are both CelesTrak feeds, not independent tracking networks.",
+        "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+        "cache": {"hit": False, "ttl_seconds": _TLE_CACHE_TTL_SECONDS},
+    }
+    _OMM_SOURCE_CACHE[catalog_id] = (now, result)
     return result
 
 @app.post("/api/v1/atmosphere")

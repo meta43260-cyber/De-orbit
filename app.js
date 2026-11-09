@@ -544,7 +544,7 @@ function renderSimulationMap(track, impact){
 let cloudTle = null;
 function setCloudTleInfo(message, color='text-gray-300'){
   const el=document.getElementById('cloudTleInfo');
-  if(el){el.textContent=message;el.className='text-xs '+color;}
+  if(el){el.textContent=message;el.className='text-xs whitespace-pre-line '+color;}
 }
 function tleAgeLabel(epoch){
   const hours=(Date.now()-new Date(epoch).getTime())/HOUR;

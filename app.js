@@ -561,7 +561,7 @@ async function fetchCloudTLE(){
   const id=String(document.getElementById('cloudNoradInput').value||document.getElementById('noradInput').value||curNorad||'').trim();
   try{
     if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
-    if(!/^\d{1,6}$/.test(id)||Number(id)<1)throw new Error('กรุณากรอก NORAD ID ตั้งแต่ 1 ถึง 999999');
+    if(!/^\d{1,5}$/.test(id)||Number(id)<1||Number(id)>99999)throw new Error('TLE แบบ 2-line รองรับ NORAD ID 1–99999; ID 6 หลักต้องใช้ OMM/JSON');
     localStorage.setItem('reentryApiBase',base);
     btn.disabled=true;btn.classList.add('opacity-50');
     setCloudTleInfo('กำลังติดต่อ Backend… หาก Render เพิ่งพักบริการ อาจใช้เวลาเริ่มระบบ 30–60 วินาที','text-yellow-300');

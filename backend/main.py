@@ -11,6 +11,7 @@ import os
 import urllib.error
 import urllib.request
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -683,7 +684,7 @@ def _parse_omm_payload(raw: str, catalog_id: int) -> dict:
 
 @app.get("/api/v1/omm/{catalog_id}")
 def get_latest_omm(catalog_id: int):
-    """Fetch CelesTrak GP/SupGP OMM JSON and select the newest valid Epoch."""
+    """Fetch CelesTrak GP/SupGP OMM JSON concurrently and select newest valid Epoch."""
     if not 1 <= catalog_id <= 999999:
         raise HTTPException(status_code=422, detail="Catalog ID ต้องอยู่ในช่วง 1–999999")
     now = time.time()
@@ -693,39 +694,68 @@ def get_latest_omm(catalog_id: int):
         result["cache"] = {"hit": True, "age_seconds": round(now - cached[0]), "ttl_seconds": _TLE_CACHE_TTL_SECONDS}
         return result
 
-    headers = {"User-Agent": "Thai-Reentry-Predictor/5.2 (educational research tool)"}
+    headers = {"User-Agent": "Thai-Reentry-Predictor/5.3 (educational research tool)"}
     specs = [
         ("CelesTrak GP OMM", f"https://celestrak.org/NORAD/elements/gp.php?CATNR={catalog_id}&FORMAT=json",
          "CelesTrak GP JSON/OMM"),
         ("CelesTrak SupGP OMM", f"https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?CATNR={catalog_id}&FORMAT=json",
          "CelesTrak supplemental; same provider, not an independent tracking network"),
     ]
-    candidates, statuses = [], []
-    for source, url, relationship in specs:
+
+    def fetch_one(spec):
+        source, url, relationship = spec
         started = time.monotonic()
         try:
             request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=8) as response:
+            with urllib.request.urlopen(request, timeout=20) as response:
                 raw = response.read().decode("utf-8", errors="replace")
             item = _parse_omm_payload(raw, catalog_id)
             item.update({"source": source, "source_url": url, "relationship": relationship,
                          "latency_ms": round((time.monotonic() - started) * 1000)})
-            candidates.append(item)
-            statuses.append({"source": source, "status": "ok", "epoch_utc": item["epoch_utc"],
-                             "latency_ms": item["latency_ms"], "relationship": relationship})
+            return item, {"source": source, "status": "ok", "epoch_utc": item["epoch_utc"],
+                          "latency_ms": item["latency_ms"], "relationship": relationship}
         except urllib.error.HTTPError as exc:
-            statuses.append({"source": source, "status": "error", "error": f"HTTP {exc.code}",
-                             "latency_ms": round((time.monotonic() - started) * 1000),
-                             "relationship": relationship})
+            return None, {"source": source, "status": "error", "error": f"HTTP {exc.code}",
+                          "latency_ms": round((time.monotonic() - started) * 1000),
+                          "relationship": relationship}
         except Exception as exc:
-            statuses.append({"source": source, "status": "error", "error": str(exc)[:240],
-                             "latency_ms": round((time.monotonic() - started) * 1000),
-                             "relationship": relationship})
+            return None, {"source": source, "status": "error", "error": str(exc)[:240],
+                          "latency_ms": round((time.monotonic() - started) * 1000),
+                          "relationship": relationship}
+
+    candidates, statuses = [], []
+    executor = ThreadPoolExecutor(max_workers=2)
+    futures = {executor.submit(fetch_one, spec): spec for spec in specs}
+    try:
+        for future in as_completed(futures, timeout=22):
+            item, status = future.result()
+            statuses.append(status)
+            if item:
+                candidates.append(item)
+    except TimeoutError:
+        pass
+    finally:
+        for future, spec in futures.items():
+            if not future.done():
+                source, _url, relationship = spec
+                statuses.append({"source": source, "status": "error",
+                                 "error": "timeout after 22 seconds (parallel request deadline)",
+                                 "latency_ms": 22000, "relationship": relationship})
+                future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # Keep diagnostics in a stable GP/SupGP order.
+    status_by_source = {item["source"]: item for item in statuses}
+    statuses = [status_by_source.get(spec[0], {
+        "source": spec[0], "status": "error", "error": "no response before deadline",
+        "latency_ms": 22000, "relationship": spec[2]
+    }) for spec in specs]
 
     if not candidates:
         raise HTTPException(status_code=503, detail={
             "message": f"ไม่พบ OMM ที่ผ่านการตรวจสอบสำหรับ Catalog ID {catalog_id}",
             "sources_checked": statuses,
+            "hint": "ตรวจสอบการเชื่อมต่อขาออกจาก Render ไปยัง CelesTrak; GP และ SupGP เป็นบริการผู้ให้บริการเดียวกัน",
         })
     candidates.sort(key=lambda x: x["epoch_timestamp"], reverse=True)
     selected = candidates[0]

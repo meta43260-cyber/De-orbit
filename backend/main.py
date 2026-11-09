@@ -27,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.6.0-scientific-validation"
+APP_VERSION = "5.7.0-epoch-comparison"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -90,6 +90,12 @@ class SGP4ValidationRequest(BaseModel):
 class LongTermValidationRequest(BaseModel):
     omm_fields: dict
     offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0], min_length=1, max_length=12)
+
+
+class EpochComparisonValidationRequest(BaseModel):
+    older_omm_fields: dict
+    newer_omm_fields: dict
+    offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0, 48.0, 72.0, 168.0], min_length=1, max_length=12)
 
 
 class BatchValidationRequest(BaseModel):
@@ -1109,6 +1115,146 @@ def validate_long_term(req: LongTermValidationRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Long-term SGP4 validation failed: {exc}") from exc
+
+
+@app.post("/api/v1/validate/epoch-comparison")
+def validate_epoch_comparison(req: EpochComparisonValidationRequest):
+    """Compare two independently time-tagged GP/OMM solutions at common future times.
+
+    This measures disagreement between catalog solutions, not error against truth.
+    """
+    def prepare_omm(raw_fields: dict, label: str):
+        fields = {str(k).upper(): v for k, v in raw_fields.items()}
+        required = ("NORAD_CAT_ID", "EPOCH", "MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
+                    "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY")
+        missing = [key for key in required if fields.get(key) in (None, "")]
+        if missing:
+            raise HTTPException(status_code=422, detail={
+                "message": f"{label}: OMM fields missing", "fields": missing
+            })
+        try:
+            catalog_id = int(fields["NORAD_CAT_ID"])
+            epoch = as_utc(datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00")))
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"{label}: invalid NORAD_CAT_ID or EPOCH: {exc}") from exc
+        if not 1 <= catalog_id <= 999999:
+            raise HTTPException(status_code=422, detail=f"{label}: OMM NORAD_CAT_ID is outside 1–999999")
+        ref_frame = str(fields.get("REF_FRAME", "TEME")).upper()
+        theory = str(fields.get("MEAN_ELEMENT_THEORY", "SGP4")).upper()
+        if ref_frame != "TEME" or theory != "SGP4":
+            raise HTTPException(status_code=422, detail={
+                "message": f"{label}: SGP4 comparison requires REF_FRAME=TEME and MEAN_ELEMENT_THEORY=SGP4",
+                "ref_frame": ref_frame, "mean_element_theory": theory
+            })
+        fields["EPOCH"] = epoch.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        fields.setdefault("OBJECT_ID", "0000-000A")
+        fields.setdefault("CLASSIFICATION_TYPE", "U")
+        fields.setdefault("EPHEMERIS_TYPE", 0)
+        fields.setdefault("ELEMENT_SET_NO", 0)
+        fields.setdefault("REV_AT_EPOCH", 0)
+        fields.setdefault("BSTAR", 0.0)
+        fields.setdefault("MEAN_MOTION_DOT", 0.0)
+        fields.setdefault("MEAN_MOTION_DDOT", 0.0)
+        sat = Satrec()
+        try:
+            initialize_omm(sat, fields)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"{label}: OMM initialization failed: {exc}") from exc
+        if sat.error:
+            raise HTTPException(status_code=422, detail={
+                "message": f"{label}: SGP4 initialization error",
+                "error": SGP4_ERRORS.get(sat.error, "SGP4 initialization error")
+            })
+        return {
+            "catalog_id": catalog_id, "epoch": epoch, "sat": sat, "fields": fields
+        }
+
+    older = prepare_omm(req.older_omm_fields, "older_omm_fields")
+    newer = prepare_omm(req.newer_omm_fields, "newer_omm_fields")
+    if older["catalog_id"] != newer["catalog_id"]:
+        raise HTTPException(status_code=422, detail="older_omm_fields และ newer_omm_fields ต้องเป็น NORAD_CAT_ID เดียวกัน")
+    if older["epoch"] >= newer["epoch"]:
+        raise HTTPException(status_code=422, detail="older_omm_fields ต้องมี EPOCH เก่ากว่า newer_omm_fields")
+    epoch_gap_hours = (newer["epoch"] - older["epoch"]).total_seconds() / 3600.0
+    if epoch_gap_hours > 720.0:
+        raise HTTPException(status_code=422, detail="ระยะห่างระหว่าง OMM epochs ต้องไม่เกิน 30 วัน")
+
+    offsets = sorted(set(float(x) for x in req.offsets_hours))
+    if any(not math.isfinite(x) or x < 0 or x > 168 for x in offsets):
+        raise HTTPException(status_code=422, detail="offsets_hours ต้องอยู่ระหว่าง 0 ถึง 168 ชั่วโมง")
+
+    samples = []
+    position_differences = []
+    velocity_differences = []
+    for offset in offsets:
+        when = newer["epoch"] + timedelta(hours=offset)
+        jd, fr = julian_parts(when)
+        old_error, old_pos, old_vel = older["sat"].sgp4(jd, fr)
+        new_error, new_pos, new_vel = newer["sat"].sgp4(jd, fr)
+        item = {"offset_hours_from_newer_epoch": offset, "time_utc": when.isoformat()}
+        if old_error or new_error:
+            item.update({
+                "status": "error",
+                "older_error": SGP4_ERRORS.get(old_error) if old_error else None,
+                "newer_error": SGP4_ERRORS.get(new_error) if new_error else None,
+            })
+        else:
+            pos_delta_km = float(np.linalg.norm(np.asarray(old_pos) - np.asarray(new_pos)))
+            vel_delta_km_s = float(np.linalg.norm(np.asarray(old_vel) - np.asarray(new_vel)))
+            position_differences.append(pos_delta_km)
+            velocity_differences.append(vel_delta_km_s)
+            item.update({
+                "status": "ok",
+                "older_position_teme_km": list(old_pos),
+                "newer_position_teme_km": list(new_pos),
+                "position_disagreement_km": pos_delta_km,
+                "velocity_disagreement_m_s": vel_delta_km_s * 1000.0,
+            })
+        samples.append(item)
+
+    if not position_differences:
+        raise HTTPException(status_code=422, detail="ไม่มี sample ที่คำนวณเปรียบเทียบได้")
+    rms_position = math.sqrt(sum(x * x for x in position_differences) / len(position_differences))
+    rms_velocity = math.sqrt(sum(x * x for x in velocity_differences) / len(velocity_differences))
+    all_ok = all(x["status"] == "ok" for x in samples)
+    return {
+        "api_version": APP_VERSION,
+        "catalog_id": older["catalog_id"],
+        "test_type": "two_epoch_omm_solution_disagreement",
+        "comparison_status": "completed" if all_ok else "partial",
+        "older_epoch_utc": older["epoch"].isoformat(),
+        "newer_epoch_utc": newer["epoch"].isoformat(),
+        "epoch_separation_hours": epoch_gap_hours,
+        "comparison_window": "Both OMM solutions propagated to the same times, beginning at the newer OMM epoch.",
+        "sample_count": len(samples),
+        "successful_sample_count": len(position_differences),
+        "position_disagreement_summary_km": {
+            "rms": rms_position,
+            "maximum": max(position_differences),
+            "minimum": min(position_differences),
+        },
+        "velocity_disagreement_summary_m_s": {
+            "rms": rms_velocity * 1000.0,
+            "maximum": max(velocity_differences) * 1000.0,
+        },
+        "samples": samples,
+        "interpretation": "ค่าที่รายงานคือความไม่ตรงกันระหว่างคำตอบจาก OMM สองชุด ไม่ใช่ความคลาดเคลื่อนจากตำแหน่งจริงหรือ truth ephemeris",
+        "provenance": {
+            "older_originator": older["fields"].get("ORIGINATOR"),
+            "newer_originator": newer["fields"].get("ORIGINATOR"),
+            "older_creation_date": older["fields"].get("CREATION_DATE"),
+            "newer_creation_date": newer["fields"].get("CREATION_DATE"),
+            "older_gp_id": older["fields"].get("GP_ID"),
+            "newer_gp_id": newer["fields"].get("GP_ID"),
+        },
+        "limitations": [
+            "ต้องเป็น OMM ของวัตถุเดียวกันและใช้ TEME/SGP4",
+            "แม้ EPOCH ต่างกัน OMM ทั้งสองชุดอาจมาจาก catalog หรือเครือข่ายติดตามชุดเดียวกัน",
+            "ความแตกต่างระหว่างสองคำตอบไม่ใช่ absolute orbit error เพราะไม่มี truth ephemeris หรือข้อมูลสังเกตอิสระ",
+            "การ propagate ทั้งสองชุดใช้แบบจำลอง SGP4; ผลอาจได้รับผลจากความไม่แน่นอนของ BSTAR และแรงรบกวน",
+            "ผลนี้ไม่ใช่การรับรองความแม่นยำของการทำนาย re-entry",
+        ],
+    }
 
 
 @app.post("/api/v1/validate/batch")

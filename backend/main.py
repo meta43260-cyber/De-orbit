@@ -29,7 +29,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "6.4.0-offline-omm-ingestion"
+APP_VERSION = "6.5.0-unified-archive-backup"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -40,7 +40,7 @@ ENTRY_ALT_DEFAULT_KM = 120.0
 MSIS_VERSION = 0             # NRLMSISE-00 (not MSIS 2.x)
 
 app = FastAPI(
-    title="Thai Re-entry Predictor API v6.4",
+    title="Thai Re-entry Predictor API v6.5",
     version=APP_VERSION,
     description="Advanced phone-cloud orbital decay, offline OMM ingestion, verified archive backup and controlled recovery API; research prototype, not an operational forecast.",
 )
@@ -1164,21 +1164,26 @@ def get_omm_history(catalog_id: int, limit: int = 20):
         conn.close()
 
 
-def _archive_canonical_digest(fetch_states: list, records: list) -> str:
+def _archive_canonical_digest(fetch_states: list, records: list, offline_records: Optional[list] = None) -> str:
+    # Schema v1 hashes only the original GP_HISTORY collections for backward compatibility.
+    document = {"fetch_states": fetch_states, "records": records}
+    if offline_records is not None:
+        document["offline_records"] = offline_records
     canonical = json.dumps(
-        {"fetch_states": fetch_states, "records": records},
-        sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _validate_archive_document(document: dict) -> tuple[list, list]:
+def _validate_archive_document(document: dict) -> tuple[list, list, list, int]:
     if not isinstance(document, dict):
         raise HTTPException(status_code=422, detail="Backup body must be a JSON object")
     if document.get("backup_format") != "thai-reentry-predictor-omm-archive":
         raise HTTPException(status_code=422, detail="Unsupported backup_format")
-    if document.get("backup_schema_version") != 1:
+    schema_version = document.get("backup_schema_version")
+    if schema_version not in (1, 2):
         raise HTTPException(status_code=422, detail="Unsupported backup_schema_version")
+
     fetch_states = document.get("fetch_states")
     records = document.get("records")
     if not isinstance(fetch_states, list) or not isinstance(records, list):
@@ -1188,6 +1193,15 @@ def _validate_archive_document(document: dict) -> tuple[list, list]:
     if document.get("record_count") != len(records):
         raise HTTPException(status_code=422, detail="record_count does not match records")
 
+    if schema_version == 2:
+        offline_records = document.get("offline_records")
+        if not isinstance(offline_records, list):
+            raise HTTPException(status_code=422, detail="offline_records must be an array for schema version 2")
+        if document.get("offline_record_count") != len(offline_records):
+            raise HTTPException(status_code=422, detail="offline_record_count does not match offline_records")
+    else:
+        offline_records = []
+
     supplied_hash = document.get("sha256")
     if not isinstance(supplied_hash, str) or len(supplied_hash) != 64:
         raise HTTPException(status_code=422, detail="sha256 must be a 64-character hex digest")
@@ -1195,7 +1209,9 @@ def _validate_archive_document(document: dict) -> tuple[list, list]:
         int(supplied_hash, 16)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="sha256 is not valid hexadecimal") from exc
-    actual_hash = _archive_canonical_digest(fetch_states, records)
+    actual_hash = _archive_canonical_digest(
+        fetch_states, records, offline_records if schema_version == 2 else None
+    )
     if not hmac.compare_digest(supplied_hash.lower(), actual_hash):
         raise HTTPException(status_code=422, detail={
             "message": "Backup SHA-256 verification failed",
@@ -1274,20 +1290,58 @@ def _validate_archive_document(document: dict) -> tuple[list, list]:
                 "fetch_state_record_count": int(state.get("record_count", 0)),
                 "actual_record_count": record_counts.get(cid, 0)
             })
-    return fetch_states, records
+
+    seen_offline = set()
+    for index, record in enumerate(offline_records):
+        if not isinstance(record, dict):
+            raise HTTPException(status_code=422, detail=f"offline_records[{index}] must be an object")
+        try:
+            cid = int(record["catalog_id"])
+            epoch = str(record["epoch_utc"])
+            source = str(record["source"])
+            payload = record["payload"]
+            imported_at = record["imported_at_utc"]
+            datetime.fromisoformat(epoch.replace("Z", "+00:00"))
+            datetime.fromisoformat(str(imported_at).replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid offline_records[{index}]") from exc
+        if not 1 <= cid <= 999999 or source not in ("synthetic_test", "user_supplied") or not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail=f"Invalid catalog_id, source or payload in offline_records[{index}]")
+        key = (cid, epoch, source)
+        if key in seen_offline:
+            raise HTTPException(status_code=422, detail=f"Duplicate catalog_id/epoch/source in offline_records[{index}]")
+        seen_offline.add(key)
+        try:
+            validated_source, normalized = _validate_offline_omm_document({
+                "source": source, "records": [payload]
+            })
+        except HTTPException as exc:
+            raise HTTPException(status_code=422, detail={
+                "message": f"Invalid offline OMM payload at offline_records[{index}]",
+                "detail": exc.detail
+            }) from exc
+        if normalized[0]["catalog_id"] != cid or normalized[0]["epoch_utc"] != as_utc(
+            datetime.fromisoformat(epoch.replace("Z", "+00:00"))
+        ).isoformat():
+            raise HTTPException(status_code=422, detail=f"Offline record metadata mismatch in offline_records[{index}]")
+
+    return fetch_states, records, offline_records, schema_version
 
 
 @app.post("/api/v1/v6/backup/verify")
 def v6_backup_verify(document: dict):
     """Verify archive structure and SHA-256 without changing the database."""
-    fetch_states, records = _validate_archive_document(document)
+    fetch_states, records, offline_records, schema_version = _validate_archive_document(document)
     return {
         "api_version": APP_VERSION,
         "status": "verified",
-        "backup_schema_version": 1,
+        "backup_schema_version": schema_version,
         "fetch_state_count": len(fetch_states),
         "record_count": len(records),
-        "sha256": _archive_canonical_digest(fetch_states, records),
+        "offline_record_count": len(offline_records),
+        "sha256": _archive_canonical_digest(
+            fetch_states, records, offline_records if schema_version == 2 else None
+        ),
         "database_modified": False,
         "gp_history_requested": False
     }
@@ -1308,9 +1362,10 @@ def v6_backup_restore(
     if not x_archive_restore_token or not hmac.compare_digest(x_archive_restore_token, configured_token):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Archive-Restore-Token")
 
-    fetch_states, records = _validate_archive_document(document)
+    fetch_states, records, offline_records, schema_version = _validate_archive_document(document)
     catalog_ids = sorted({int(x["catalog_id"]) for x in fetch_states} |
-                         {int(x["catalog_id"]) for x in records})
+                         {int(x["catalog_id"]) for x in records} |
+                         {int(x["catalog_id"]) for x in offline_records})
     if not catalog_ids:
         raise HTTPException(status_code=422, detail="Empty backup: nothing to restore")
 
@@ -1324,13 +1379,15 @@ def v6_backup_restore(
                 existing = conn.execute("""
                     SELECT
                       (SELECT COUNT(*) FROM omm_history_fetches) AS fetch_count,
-                      (SELECT COUNT(*) FROM omm_history_records) AS record_count
+                      (SELECT COUNT(*) FROM omm_history_records) AS record_count,
+                      (SELECT COUNT(*) FROM omm_offline_records) AS offline_count
                 """).fetchone()
-                if int(existing["fetch_count"]) or int(existing["record_count"]):
+                if int(existing["fetch_count"]) or int(existing["record_count"]) or int(existing["offline_count"]):
                     raise HTTPException(status_code=409, detail={
                         "status": "restore_requires_empty_archive",
                         "existing_fetch_states": int(existing["fetch_count"]),
                         "existing_records": int(existing["record_count"]),
+                        "existing_offline_records": int(existing["offline_count"]),
                         "note": "No database rows were changed. Export the current archive before considering a controlled merge."
                     })
 
@@ -1360,6 +1417,22 @@ def v6_backup_restore(
                         str(record["source"]),
                         json.dumps(record["payload"], separators=(",", ":"), ensure_ascii=False)
                     ))
+
+                for record in offline_records:
+                    epoch_dt = as_utc(datetime.fromisoformat(
+                        str(record["epoch_utc"]).replace("Z", "+00:00")
+                    ))
+                    conn.execute("""
+                        INSERT INTO omm_offline_records
+                        (catalog_id,epoch_utc,source,payload_json,imported_at_utc)
+                        VALUES(%s,%s,%s,%s,%s)
+                    """, (
+                        int(record["catalog_id"]), epoch_dt.isoformat(), str(record["source"]),
+                        json.dumps(record["payload"], separators=(",", ":"), ensure_ascii=False),
+                        as_utc(datetime.fromisoformat(
+                            str(record["imported_at_utc"]).replace("Z", "+00:00")
+                        )).isoformat()
+                    ))
         finally:
             conn.close()
         return {
@@ -1367,8 +1440,12 @@ def v6_backup_restore(
             "status": "restored",
             "restored_fetch_state_count": len(fetch_states),
             "restored_record_count": len(records),
+            "restored_offline_record_count": len(offline_records),
+            "backup_schema_version": schema_version,
             "catalog_count": len(catalog_ids),
-            "sha256": _archive_canonical_digest(fetch_states, records),
+            "sha256": _archive_canonical_digest(
+                fetch_states, records, offline_records if schema_version == 2 else None
+            ),
             "database_modified": True,
             "gp_history_requested": False,
             "note": "Restore completed transactionally into an empty archive. No Space-Track request was made."
@@ -1401,6 +1478,13 @@ def v6_backup_status():
                        completed_at_utc, error
                 FROM omm_history_fetches ORDER BY catalog_id
             """).fetchall()
+            offline_totals = conn.execute("""
+                SELECT COUNT(*) AS record_count,
+                       COUNT(DISTINCT catalog_id) AS catalog_count,
+                       MIN(epoch_utc) AS earliest_epoch_utc,
+                       MAX(epoch_utc) AS latest_epoch_utc
+                FROM omm_offline_records
+            """).fetchone()
             conn.commit()
         finally:
             conn.close()
@@ -1409,8 +1493,10 @@ def v6_backup_status():
             "status": "ok",
             "archive": dict(totals),
             "fetch_states": [dict(row) for row in states],
+            "offline_archive": dict(offline_totals),
+            "combined_record_count": int(totals["record_count"]) + int(offline_totals["record_count"]),
             "gp_history_requested": False,
-            "note": "Read-only database inspection; no Space-Track request is made."
+            "note": "Read-only inspection of both GP_HISTORY and offline OMM tables; no Space-Track request is made."
         }
     except Exception as exc:
         raise HTTPException(status_code=503, detail={
@@ -1437,6 +1523,10 @@ def v6_backup_export(catalog_id: Optional[int] = None):
                     SELECT catalog_id, epoch_utc, creation_date, source, payload_json
                     FROM omm_history_records ORDER BY catalog_id, epoch_utc
                 """).fetchall()
+                offline_rows = conn.execute("""
+                    SELECT catalog_id, epoch_utc, source, payload_json, imported_at_utc
+                    FROM omm_offline_records ORDER BY catalog_id, epoch_utc, source
+                """).fetchall()
             else:
                 fetch_rows = conn.execute("""
                     SELECT catalog_id, status, attempted_at_utc, completed_at_utc,
@@ -1446,6 +1536,10 @@ def v6_backup_export(catalog_id: Optional[int] = None):
                 record_rows = conn.execute("""
                     SELECT catalog_id, epoch_utc, creation_date, source, payload_json
                     FROM omm_history_records WHERE catalog_id=%s ORDER BY epoch_utc
+                """, (catalog_id,)).fetchall()
+                offline_rows = conn.execute("""
+                    SELECT catalog_id, epoch_utc, source, payload_json, imported_at_utc
+                    FROM omm_offline_records WHERE catalog_id=%s ORDER BY epoch_utc, source
                 """, (catalog_id,)).fetchall()
             conn.commit()
         finally:
@@ -1459,32 +1553,42 @@ def v6_backup_export(catalog_id: Optional[int] = None):
             "payload": json.loads(row["payload_json"])
         } for row in record_rows]
         fetch_states = [dict(row) for row in fetch_rows]
-        digest_input = json.dumps(
-            {"fetch_states": fetch_states, "records": records},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
+        offline_records = [{
+            "catalog_id": row["catalog_id"],
+            "epoch_utc": row["epoch_utc"],
+            "source": row["source"],
+            "payload": json.loads(row["payload_json"]),
+            "imported_at_utc": row["imported_at_utc"]
+        } for row in offline_rows]
+        digest = _archive_canonical_digest(fetch_states, records, offline_records)
         return {
             "backup_format": "thai-reentry-predictor-omm-archive",
-            "backup_schema_version": 1,
+            "backup_schema_version": 2,
             "api_version": APP_VERSION,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             "catalog_id_filter": catalog_id,
             "fetch_state_count": len(fetch_states),
             "record_count": len(records),
-            "sha256": hashlib.sha256(digest_input).hexdigest(),
+            "offline_record_count": len(offline_records),
+            "sha256": digest,
             "fetch_states": fetch_states,
             "records": records,
+            "offline_records": offline_records,
             "verification": {
                 "algorithm": "SHA-256",
-                "canonicalization": "UTF-8 JSON; sorted keys; compact separators; hash covers fetch_states and records",
+                "canonicalization": "UTF-8 JSON; sorted keys; compact separators; hash covers fetch_states, records and offline_records",
                 "restore_endpoint_available": True,
                 "restore_requires_authentication": True,
-                "restore_requires_empty_archive": True
+                "restore_requires_empty_archive": True,
+                "includes_offline_omm": True,
+                "offline_record_count": len(offline_records)
             },
             "limitations": [
                 "This export is a backup copy, not an independent validation of the source orbital data.",
+                "Includes both Space-Track GP_HISTORY archive rows and offline-imported OMM rows.",
                 "No Space-Track request is made by this endpoint.",
-                "Restore requires ARCHIVE_RESTORE_TOKEN and an empty destination archive; verify the backup before restore."
+                "Restore requires ARCHIVE_RESTORE_TOKEN and all three destination tables to be empty; verify the backup before restore.",
+                "Schema version 1 backups remain verifiable/restorable, but contain no offline OMM records."
             ]
         }
     except Exception as exc:

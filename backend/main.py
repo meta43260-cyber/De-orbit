@@ -761,6 +761,12 @@ def get_omm_history(catalog_id: int, limit: int = 20):
         raise HTTPException(status_code=422, detail="Catalog ID ต้องอยู่ในช่วง 1–999999")
     if not 2 <= limit <= 50:
         raise HTTPException(status_code=422, detail="limit ต้องอยู่ระหว่าง 2 ถึง 50")
+    if os.getenv("HISTORY_STORAGE_CONFIRMED") != "1" or not os.path.abspath(HISTORY_DB_PATH).startswith("/var/data/"):
+        raise HTTPException(status_code=503, detail={
+            "message": "Historical OMM fetch is locked until durable storage is configured. This prevents losing the one-time GP_HISTORY download on a Render Free instance.",
+            "required_setup": "Attach a persistent disk mounted at /var/data, set HISTORY_DB_PATH=/var/data/omm_history.sqlite3 and HISTORY_STORAGE_CONFIRMED=1, then redeploy.",
+            "storage": _history_storage_info()
+        })
 
     with _HISTORY_FETCH_LOCK:
         conn = _history_db()

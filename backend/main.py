@@ -27,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.4.0-spacetrack-primary"
+APP_VERSION = "5.5.0-sgp4-validation"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -80,6 +80,12 @@ class SimulationRequest(BaseModel):
     f107_sfu: float = Field(default=150.0, ge=50, le=400)
     f107a_sfu: float = Field(default=150.0, ge=50, le=400)
     ap: float = Field(default=15.0, ge=0, le=400)
+
+
+class SGP4ValidationRequest(BaseModel):
+    omm_fields: dict
+    tle_line1: Optional[str] = None
+    tle_line2: Optional[str] = None
 
 
 def as_utc(value: datetime) -> datetime:
@@ -297,8 +303,7 @@ def state_diagnostics(when: datetime, y: np.ndarray, req):
     rho, temp = msis_density(when, lat, lon, alt_km, req)
     v_atm = np.cross(np.array([0.0, 0.0, EARTH_OMEGA]), r)
     v_rel = v - v_atm
-    speed_rel = float(np.linalg.norm(v_rel))
-    drag_acc = -0.5 * rho * req.drag_coefficient * req.reference_area_m2 / req.mass_kg * speed_rel * v_rel
+    speed_rel = float(np.linalg.norm(v_rel))    drag_acc = -0.5 * rho * req.drag_coefficient * req.reference_area_m2 / req.mass_kg * speed_rel * v_rel
     decel = float(np.linalg.norm(drag_acc))
     q_dyn = 0.5 * rho * speed_rel * speed_rel
     heat_flux = 1.83e-4 * math.sqrt(max(rho, 0.0) / req.nose_radius_m) * speed_rel ** 3
@@ -597,8 +602,7 @@ def get_latest_tle(norad_id: int):
                               "latency_ms": round((time.monotonic() - started) * 1000),
                               "relationship": mirror_relationship})
 
-    if not candidates:
-        raise HTTPException(status_code=503, detail={
+    if not candidates:        raise HTTPException(status_code=503, detail={
             "message": f"ไม่พบ TLE ที่ผ่านการตรวจสอบสำหรับ NORAD {norad_id}",
             "sources_checked": source_status,
         })
@@ -884,6 +888,127 @@ def atmosphere(req: AtmosphereRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"MSISE-00 calculation failed: {exc}") from exc
+
+
+@app.post("/api/v1/validate/sgp4")
+def validate_sgp4(req: SGP4ValidationRequest):
+    """Validate OMM SGP4 initialization and propagate at fixed offsets; optionally compare its TLE export."""
+    try:
+        fields = {str(k).upper(): v for k, v in req.omm_fields.items()}
+        required = ("NORAD_CAT_ID", "EPOCH", "MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
+                    "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY")
+        missing = [key for key in required if fields.get(key) in (None, "")]
+        if missing:
+            raise HTTPException(status_code=422, detail={"message": "OMM fields missing", "fields": missing})
+
+        catalog_id = int(fields["NORAD_CAT_ID"])
+        if not 1 <= catalog_id <= 999999:
+            raise HTTPException(status_code=422, detail="OMM NORAD_CAT_ID is outside 1–999999")
+
+        epoch = datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00"))
+        epoch = as_utc(epoch)
+        fields["EPOCH"] = epoch.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S.%f")
+        fields.setdefault("OBJECT_ID", "0000-000A")
+        fields.setdefault("CLASSIFICATION_TYPE", "U")
+        fields.setdefault("EPHEMERIS_TYPE", 0)
+        fields.setdefault("ELEMENT_SET_NO", 0)
+        fields.setdefault("REV_AT_EPOCH", 0)
+        fields.setdefault("BSTAR", 0.0)
+        fields.setdefault("MEAN_MOTION_DOT", 0.0)
+        fields.setdefault("MEAN_MOTION_DDOT", 0.0)
+
+        omm_sat = Satrec()
+        initialize_omm(omm_sat, fields)
+        if omm_sat.error:
+            raise ValueError(SGP4_ERRORS.get(omm_sat.error, "SGP4 OMM initialization error"))
+
+        has_line1 = bool(req.tle_line1 and req.tle_line1.strip())
+        has_line2 = bool(req.tle_line2 and req.tle_line2.strip())
+        if has_line1 != has_line2:
+            raise HTTPException(status_code=422, detail="ต้องส่ง TLE line 1 และ line 2 พร้อมกัน")
+        tle_sat = None
+        if has_line1 and has_line2:
+            if catalog_id > 99999:
+                raise HTTPException(status_code=422, detail="TLE comparison รองรับเฉพาะ Catalog ID ไม่เกิน 99999")
+            if int(req.tle_line1[2:7]) != catalog_id or int(req.tle_line2[2:7]) != catalog_id:
+                raise HTTPException(status_code=422, detail="TLE Catalog ID ไม่ตรงกับ OMM")
+            tle_sat = make_satrec(req.tle_line1, req.tle_line2)
+
+        samples = []
+        comparison_available = tle_sat is not None
+        for offset_minutes in (0, 10, 30, 60):
+            sample_time = epoch + timedelta(minutes=offset_minutes)
+            jd, fr = julian_parts(sample_time)
+            omm_error, omm_pos, omm_vel = omm_sat.sgp4(jd, fr)
+            sample = {
+                "offset_minutes": offset_minutes,
+                "time_utc": sample_time.isoformat(),
+                "omm": {"status": "ok", "position_teme_km": list(omm_pos), "velocity_teme_km_s": list(omm_vel)},
+            }
+            if omm_error:
+                sample["omm"] = {
+                    "status": "error",
+                    "error_code": int(omm_error),
+                    "error": SGP4_ERRORS.get(omm_error, "SGP4 propagation error"),
+                }
+                sample["status"] = "error"
+                samples.append(sample)
+                continue
+
+            if tle_sat is not None:
+                tle_error, tle_pos, tle_vel = tle_sat.sgp4(jd, fr)
+                if tle_error:
+                    sample["tle_export"] = {
+                        "status": "error",
+                        "error_code": int(tle_error),
+                        "error": SGP4_ERRORS.get(tle_error, "SGP4 propagation error"),
+                    }
+                    sample["status"] = "comparison_error"
+                else:
+                    position_delta_km = float(np.linalg.norm(np.asarray(omm_pos) - np.asarray(tle_pos)))
+                    velocity_delta_km_s = float(np.linalg.norm(np.asarray(omm_vel) - np.asarray(tle_vel)))
+                    sample["tle_export"] = {
+                        "status": "ok",
+                        "position_teme_km": list(tle_pos),
+                        "velocity_teme_km_s": list(tle_vel),
+                    }
+                    sample["comparison"] = {
+                        "position_difference_m": position_delta_km * 1000.0,
+                        "velocity_difference_m_s": velocity_delta_km_s * 1000.0,
+                        "note": "Difference reflects TLE text-field rounding and SGP4 initialization representation; it is not an independent accuracy assessment.",
+                    }
+                    sample["status"] = "ok"
+            else:
+                sample["status"] = "ok"
+            samples.append(sample)
+
+        all_omm_ok = all(s["omm"]["status"] == "ok" for s in samples)
+        all_comparisons_ok = (not comparison_available) or all(
+            s.get("comparison") is not None and s.get("status") == "ok" for s in samples
+        )
+        return {
+            "api_version": APP_VERSION,
+            "validation": "passed" if all_omm_ok and all_comparisons_ok else "failed",
+            "catalog_id": catalog_id,
+            "epoch_utc": epoch.isoformat(),
+            "source_note": "Validation uses the supplied OMM fields. It does not independently verify the catalog observations or orbit accuracy.",
+            "sgp4_initialization": "passed",
+            "propagation_offsets_minutes": [0, 10, 30, 60],
+            "omm_propagation": "passed" if all_omm_ok else "failed",
+            "tle_export_comparison": "passed" if comparison_available and all_comparisons_ok else (
+                "not_requested" if not comparison_available else "failed"
+            ),
+            "samples": samples,
+            "limitations": [
+                "TEME position and velocity are SGP4 outputs, not Earth-fixed coordinates.",
+                "OMM and exported TLE originate from the same catalog record; agreement is a format/implementation consistency check, not independent validation.",
+                "This test does not validate long-term orbit prediction, atmospheric drag accuracy, or re-entry location.",
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"SGP4 validation failed: {exc}") from exc
 
 
 @app.post("/api/v1/simulate")

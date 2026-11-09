@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 
-APP_VERSION = "5.0.0-cloud-alpha"
+APP_VERSION = "5.1.0-multisource-alpha"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3

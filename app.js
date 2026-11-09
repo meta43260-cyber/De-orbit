@@ -571,7 +571,7 @@ async function fetchCloudTLE(){
     try{response=await fetch(base+'/api/v1/tle/'+encodeURIComponent(id),{method:'GET',headers:{'Accept':'application/json'},signal:controller.signal});}
     finally{clearTimeout(timer);}
     const data=await response.json().catch(()=>({}));
-    if(!response.ok)throw new Error(data.detail||('Backend ตอบ HTTP '+response.status));
+    if(!response.ok)throw new Error((data.detail&&typeof data.detail==='object'?data.detail.message:data.detail)||('Backend ตอบ HTTP '+response.status));
     if(Number(data.norad_id)!==Number(id)||!validTLE(data.line1,data.line2,id))throw new Error('TLE ที่ได้รับไม่ผ่านการตรวจสอบ NORAD ID หรือ checksum');
     const epochMs=new Date(data.epoch_utc).getTime();
     if(!Number.isFinite(epochMs))throw new Error('Backend ส่ง Epoch ที่อ่านไม่ได้');
@@ -580,7 +580,17 @@ async function fetchCloudTLE(){
     const ageHours=(Date.now()-epochMs)/HOUR;
     const freshness=ageHours>72?'ข้อมูลเก่ากว่า 72 ชั่วโมง — ควรตรวจสอบก่อนจำลอง':ageHours>24?'ข้อมูลเก่ากว่า 24 ชั่วโมง':'ข้อมูลค่อนข้างใหม่';
     const color=ageHours>72?'text-red-300':ageHours>24?'text-yellow-300':'text-green-300';
-    setCloudTleInfo('✓ '+cloudTle.name+' (#'+id+') · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+' · '+cloudTle.source+' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness,color);
+    const sourceLines=(data.sources_checked||[]).map(x=>{
+      const mark=x.status==='ok'?'✓':'✕';
+      const epoch=x.epoch_utc?' · Epoch '+new Date(x.epoch_utc).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC':'';
+      const err=x.error?' · '+x.error:'';
+      return mark+' '+x.source+epoch+err;
+    });
+    const candidateLines=(data.candidates||[]).map((x,i)=>
+      (i+1)+'. '+x.source+' · Epoch '+new Date(x.epoch_utc).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC'+(x.source===data.selected_source?' ← เลือกใช้':'')
+    );
+    const detailText='✓ '+cloudTle.name+' (#'+id+') · เลือก '+cloudTle.source+' ด้วย Epoch ใหม่ที่สุด · Epoch '+new Date(epochMs).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · อายุ '+tleAgeLabel(data.epoch_utc)+' · ดึงเมื่อ '+new Date(cloudTle.fetched_at_utc).toLocaleString('th-TH')+' · '+freshness+'\\n\\nผลตรวจแหล่งข้อมูล:\\n'+sourceLines.join('\\n')+'\\n\\nชุด TLE ที่ผ่านการตรวจสอบ:\\n'+candidateLines.join('\\n')+'\\n\\nหมายเหตุ: '+(data.source_independence_note||'แหล่งข้อมูลอาจมีต้นทางร่วมกัน'));
+    setCloudTleInfo(detailText,color);
     if(status){status.textContent='รับ TLE แล้ว — พร้อมส่งเข้าแบบจำลอง';status.className='text-xs text-green-300';}
   }catch(err){
     cloudTle=null;

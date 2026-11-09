@@ -795,6 +795,7 @@ def _validate_offline_omm_document(document: dict) -> tuple[str, list]:
     )
     seen = set()
     normalized = []
+    document_catalog_id = None
     for index, raw in enumerate(records):
         if not isinstance(raw, dict):
             raise HTTPException(status_code=422, detail=f"records[{index}] ต้องเป็น object")
@@ -837,7 +838,9 @@ def _validate_offline_omm_document(document: dict) -> tuple[str, list]:
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"OMM records[{index}] ไม่ถูกต้อง: {exc}") from exc
 
-        if catalog_id != int(str({str(k).upper(): v for k, v in records[0].items()}.get("NORAD_CAT_ID", 0))):
+        if document_catalog_id is None:
+            document_catalog_id = catalog_id
+        elif catalog_id != document_catalog_id:
             raise HTTPException(status_code=422, detail="OMM ทุกชุดต้องเป็น NORAD_CAT_ID เดียวกัน")
         key = (catalog_id, epoch)
         if key in seen:
@@ -2597,72 +2600,3 @@ def v6_reentry_scenario(req: V6ReentryScenarioRequest):
                 steps += 1
                 save(last_diag, elapsed, current_time, mass)
                 break
-
-            y, mass = y_new, new_mass
-            elapsed += dt
-            current_time = next_time
-            base.mass_kg = max(mass, 1e-6)
-            _, last_diag = acceleration(current_time, y, base)
-            steps += 1
-            if elapsed - last_saved >= req.sample_interval_s or steps == 1:
-                save(last_diag, elapsed, current_time, mass)
-                last_saved = elapsed
-
-        if steps >= max_steps:
-            status = "step_limit"
-        if not points:
-            save(last_diag, elapsed, current_time, mass)
-        return {
-            "api_version": APP_VERSION,
-            "model": {
-                "orbit_initialization": "SGP4 / TEME", "atmosphere": "NRLMSISE-00 via pymsis",
-                "gravity": "Earth central gravity + J2", "drag": "quadratic aerodynamic drag",
-                "integration": "explicit midpoint RK2; altitude-dependent step capped at 1 s",
-                "ablation": "lumped effective heat-flux-to-mass-loss proxy",
-                "fragmentation": "not modeled", "winds": "not modeled",
-            },
-            "object": {
-                "object_type": req.object_type, "material_label": req.material_label,
-                "initial_mass_kg": initial_mass, "reference_area_m2": req.reference_area_m2,
-                "drag_coefficient": req.drag_coefficient, "nose_radius_m": req.nose_radius_m,
-                "heat_of_ablation_j_kg": req.heat_of_ablation_j_kg,
-                "ablation_efficiency": req.ablation_efficiency,
-                "heated_area_factor": req.heated_area_factor,
-            },
-            "entry_interface": {
-                "source": entry_source, "time_utc": entry_time.isoformat(),
-                "latitude_deg": entry_geo[0], "longitude_deg": entry_geo[1],
-                "altitude_km": entry_geo[2], "velocity_km_s": float(np.linalg.norm(v0)) / 1000.0,
-            },
-            "status": status, "impact": impact, "elapsed_simulation_s": round(elapsed, 3),
-            "steps": steps, "final_mass_kg": round(mass, 6),
-            "mass_loss_kg": round(initial_mass - mass, 6),
-            "mass_remaining_fraction": round(mass / initial_mass, 8),
-            "peak_dynamic_pressure_Pa": max((p["dynamic_pressure_Pa"] for p in points), default=0.0),
-            "peak_convective_heat_flux_W_m2": max((p["convective_heat_flux_W_m2"] for p in points), default=0.0),
-            "peak_drag_deceleration_m_s2": max((p["drag_deceleration_m_s2"] for p in points), default=0.0),
-            "track": points,
-            "limitations": [
-                "ผลเป็น scenario simulation จาก TLE/OMM ที่ผู้ใช้ส่ง ไม่ใช่ operational re-entry forecast",
-                "ablation เป็น lumped effective proxy ไม่ใช่ thermal conduction หรือ material-response solver",
-                "พื้นที่หน้าตัดและ drag coefficient คงที่; ไม่มี tumble หรือ aerodynamic shape change",
-                "ยังไม่มี fragmentation, fragment cloud, lift, wind field หรือ debris survival model",
-                "ไม่มี covariance หรือ uncertainty propagation; track ไม่ใช่ impact corridor",
-                "คุณสมบัติวัสดุและพารามิเตอร์การระเหยต้องมาจากข้อมูลหรือสมมติฐานที่ผู้ใช้ระบุ",
-            ],
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"v6 re-entry scenario failed: {str(exc)[:300]}") from exc
-
-
-
-@app.post("/api/v1/simulate")
-def simulate(req: SimulationRequest):
-    try:
-        return simulate_entry(req)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Simulation failed: {exc}") from exc

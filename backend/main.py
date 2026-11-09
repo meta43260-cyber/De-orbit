@@ -1249,12 +1249,14 @@ def v6_backup_export(catalog_id: Optional[int] = None):
             "verification": {
                 "algorithm": "SHA-256",
                 "canonicalization": "UTF-8 JSON; sorted keys; compact separators; hash covers fetch_states and records",
-                "restore_endpoint_available": False
+                "restore_endpoint_available": True,
+                "restore_requires_authentication": True,
+                "restore_requires_empty_archive": True
             },
             "limitations": [
                 "This export is a backup copy, not an independent validation of the source orbital data.",
                 "No Space-Track request is made by this endpoint.",
-                "Restore/import is intentionally not enabled until an authenticated restore workflow is implemented."
+                "Restore requires ARCHIVE_RESTORE_TOKEN and an empty destination archive; verify the backup before restore."
             ]
         }
     except Exception as exc:

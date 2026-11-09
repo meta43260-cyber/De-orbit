@@ -1,5 +1,5 @@
 """
-Thai Re-entry Predictor v5.0 — Cloud API
+Thai Re-entry Predictor v6.0 — Advanced Cloud API
 Hybrid model: SGP4 entry-interface estimate + MSISE-00 atmospheric flight.
 This is an educational/research prototype, not an operational re-entry forecast.
 """
@@ -40,7 +40,7 @@ MSIS_VERSION = 0             # NRLMSISE-00 (not MSIS 2.x)
 app = FastAPI(
     title="Thai Re-entry Predictor API",
     version=APP_VERSION,
-    description="Cloud computation API for the Thai Re-entry Predictor v5.0 prototype.",
+    description="Advanced phone-cloud orbital decay and scenario-based re-entry analysis API; research prototype, not an operational forecast.",
 )
 
 origins = os.getenv("ALLOWED_ORIGINS", "*")

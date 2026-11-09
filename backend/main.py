@@ -1046,6 +1046,26 @@ def _validate_archive_document(document: dict) -> tuple[list, list]:
         creation_date = record.get("creation_date")
         if creation_date is not None and not isinstance(creation_date, str):
             raise HTTPException(status_code=422, detail=f"Invalid creation_date in records[{index}]")
+
+    state_by_id = {int(item["catalog_id"]): item for item in fetch_states}
+    record_counts = {}
+    for record in records:
+        cid = int(record["catalog_id"])
+        record_counts[cid] = record_counts.get(cid, 0) + 1
+        state = state_by_id.get(cid)
+        if state is None or state["status"] != "completed":
+            raise HTTPException(status_code=422, detail={
+                "message": "Every archived OMM record must belong to a completed fetch state",
+                "catalog_id": cid
+            })
+    for cid, state in state_by_id.items():
+        if state["status"] == "completed" and int(state.get("record_count", 0)) != record_counts.get(cid, 0):
+            raise HTTPException(status_code=422, detail={
+                "message": "Completed fetch-state record_count does not match archived records",
+                "catalog_id": cid,
+                "fetch_state_record_count": int(state.get("record_count", 0)),
+                "actual_record_count": record_counts.get(cid, 0)
+            })
     return fetch_states, records
 
 

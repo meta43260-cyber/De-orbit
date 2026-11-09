@@ -438,28 +438,22 @@ def get_latest_tle(norad_id: int):
     headers = {"User-Agent": "Thai-Reentry-Predictor/5.0 (educational research tool)"}
     raw = None
     last_error = None
-    # Retry transient network failures and try the www hostname as a fallback.
+    # Keep the mobile-facing request bounded: at most 8 seconds per hostname.
     for url in urls:
         request = urllib.request.Request(url, headers=headers)
-        for attempt in range(2):
-            try:
-                with urllib.request.urlopen(request, timeout=25) as response:
-                    raw = response.read().decode("utf-8", errors="replace")
-                break
-            except urllib.error.HTTPError as exc:
-                # An HTTP response means the host was reached; do not hide server errors.
-                raise HTTPException(status_code=502, detail=f"CelesTrak ตอบกลับ HTTP {exc.code}") from exc
-            except Exception as exc:
-                last_error = exc
-                if attempt == 0:
-                    time.sleep(1.5)
-        if raw is not None:
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                raw = response.read().decode("utf-8", errors="replace")
             break
+        except urllib.error.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"CelesTrak ตอบกลับ HTTP {exc.code}") from exc
+        except Exception as exc:
+            last_error = exc
     if raw is None:
         raise HTTPException(
             status_code=503,
-            detail=f"ติดต่อ CelesTrak ไม่สำเร็จหลังลองหลายครั้ง: {last_error}. "
-                   "โปรดลองใหม่ภายหลัง หรือใช้ TLE จากแหล่งสำรอง",
+            detail=f"CelesTrak ยังไม่ตอบสนองหลังทดลอง 2 hostname: {last_error}. "
+                   "คำขอถูกยุติเพื่อไม่ให้หน้าเว็บค้าง โปรดลองใหม่ภายหลัง",
         )
 
     lines = [line.strip() for line in raw.splitlines() if line.strip()]

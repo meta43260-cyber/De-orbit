@@ -65,17 +65,35 @@ async function fetchTLE(id){
   let tle=null;
   const apiBase=(localStorage.getItem('reentryApiBase')||'').trim().replace(/\/+$/,'');
   if(apiBase){
+    let tleCandidate=null;
+    try{
+      const response=await fetch(apiBase+'/api/v1/tle/'+encodeURIComponent(id),{headers:{'Accept':'application/json'}});
+      if(response.ok){
+        const data=await response.json();
+        if(Number(data.norad_id)===Number(id)&&validTLE(data.line1,data.line2,id)){
+          tleCandidate={name:data.name||('NORAD '+id),line1:data.line1,line2:data.line2,
+            epoch:parseTLEEpoch(data.line1),source:data.source||'Cloud multi-source TLE',source_url:data.source_url||''};
+        }
+      }
+    }catch(e){console.warn('Cloud multi-source TLE unavailable:',e.message);}
     try{
       const response=await fetch(apiBase+'/api/v1/omm/'+encodeURIComponent(id),{headers:{'Accept':'application/json'}});
       if(response.ok){
         const data=await response.json(),ex=data.tle_export;
         if(Number(data.catalog_id)===Number(id)&&ex&&validTLE(ex.line1,ex.line2,id)){
-          tle={name:data.name||('NORAD '+id),line1:ex.line1,line2:ex.line2,epoch:parseTLEEpoch(ex.line1),
-            source:data.source||'Cloud OMM',source_url:data.source_url||'',omm_fields:data.omm_fields||null,format:'OMM+TLE'};
-          collectCatalogRecord(id,tle);saveCache(id,tle);return tle;
+          const ommCandidate={name:data.name||('NORAD '+id),line1:ex.line1,line2:ex.line2,
+            epoch:parseTLEEpoch(ex.line1),source:data.source||'Cloud OMM',source_url:data.source_url||'',
+            omm_fields:data.omm_fields||null,format:'OMM+TLE'};
+          if(!tleCandidate||ommCandidate.epoch>tleCandidate.epoch)tleCandidate=ommCandidate;
+          else if(Math.abs(ommCandidate.epoch-tleCandidate.epoch)<HOUR){
+            tleCandidate.omm_fields=ommCandidate.omm_fields;tleCandidate.format='OMM+TLE';
+          }
         }
       }
-    }catch(e){console.warn('Cloud OMM unavailable; using legacy TLE feeds:',e.message);}
+    }catch(e){console.warn('Cloud OMM feed unavailable:',e.message);}
+    if(tleCandidate){
+      collectCatalogRecord(id,tleCandidate);saveCache(id,tleCandidate);return tleCandidate;
+    }
   }
   try{
     const t=await fetchText('https://celestrak.org/NORAD/elements/gp.php?CATNR='+id+'&FORMAT=tle',8000,

@@ -27,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.8.0-data-quality-history"
+APP_VERSION = "5.9.0-orbit-reliability-evidence"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -101,6 +101,12 @@ class OMMQualityRequest(BaseModel):
 class HistoricalOMMSeriesRequest(BaseModel):
     omm_records: list[dict] = Field(min_length=2, max_length=12)
     offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0, 48.0, 72.0, 168.0], min_length=1, max_length=12)
+
+
+class OrbitReliabilityRequest(BaseModel):
+    omm_records: list[dict] = Field(min_length=2, max_length=12)
+    offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0, 48.0, 72.0, 168.0], min_length=1, max_length=12)
+    stale_after_hours: float = Field(default=24.0, ge=1.0, le=720.0)
 
 
 class LatestEpochComparisonRequest(BaseModel):
@@ -1423,6 +1429,106 @@ def validate_historical_omm_series(req: HistoricalOMMSeriesRequest):
             "OMM หลาย Epoch อาจมาจากเครือข่ายติดตามเดียวกันและไม่เป็นข้อมูลอิสระ",
             "การเปรียบเทียบแต่ละคู่ใช้ SGP4/TEME และจำกัดช่วงห่างของ Epoch ตาม endpoint epoch-comparison",
             "ผล disagreement ไม่ใช่ covariance, confidence interval หรือการรับรองความแม่นยำของ re-entry",
+        ],
+    }
+
+
+@app.post("/api/v1/validate/orbit-reliability")
+def validate_orbit_reliability(req: OrbitReliabilityRequest):
+    """Build a descriptive reliability evidence report from saved OMM snapshots.
+
+    This is an empirical catalog-solution disagreement indicator, not covariance,
+    a probability, or an estimate of absolute orbit error.
+    """
+    history = validate_historical_omm_series(HistoricalOMMSeriesRequest(
+        omm_records=req.omm_records,
+        offsets_hours=req.offsets_hours,
+    ))
+    latest_fields = {str(k).upper(): v for k, v in req.omm_records[0].items()}
+    for raw in req.omm_records[1:]:
+        fields = {str(k).upper(): v for k, v in raw.items()}
+        try:
+            if as_utc(datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00"))) > as_utc(
+                datetime.fromisoformat(str(latest_fields["EPOCH"]).replace("Z", "+00:00"))
+            ):
+                latest_fields = fields
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid OMM EPOCH: {exc}") from exc
+
+    quality = validate_omm_quality(OMMQualityRequest(
+        omm_fields=latest_fields,
+        stale_after_hours=req.stale_after_hours,
+    ))
+
+    by_horizon = {}
+    for offset in sorted(set(float(x) for x in req.offsets_hours)):
+        if not math.isfinite(offset) or offset < 0 or offset > 168:
+            raise HTTPException(status_code=422, detail="offsets_hours ต้องอยู่ระหว่าง 0 ถึง 168 ชั่วโมง")
+        positions, velocities = [], []
+        for comparison in history["adjacent_comparisons"]:
+            sample = next((x for x in comparison["samples"]
+                           if x.get("status") == "ok"
+                           and abs(float(x["offset_hours_from_newer_epoch"]) - offset) < 1e-9), None)
+            if sample:
+                positions.append(float(sample["position_disagreement_km"]))
+                velocities.append(float(sample["velocity_disagreement_m_s"]))
+        by_horizon[str(offset)] = {
+            "offset_hours": offset,
+            "available_pair_count": len(positions),
+            "position_disagreement_rms_across_pairs_km": (
+                math.sqrt(sum(x*x for x in positions) / len(positions)) if positions else None
+            ),
+            "position_disagreement_max_across_pairs_km": max(positions) if positions else None,
+            "velocity_disagreement_rms_across_pairs_m_s": (
+                math.sqrt(sum(x*x for x in velocities) / len(velocities)) if velocities else None
+            ),
+            "velocity_disagreement_max_across_pairs_m_s": max(velocities) if velocities else None,
+        }
+
+    position_rms_values = [
+        item["position_disagreement_rms_across_pairs_km"]
+        for item in by_horizon.values()
+        if item["position_disagreement_rms_across_pairs_km"] is not None
+    ]
+    if len(position_rms_values) >= 2:
+        if position_rms_values[-1] > position_rms_values[0] * 1.05:
+            divergence_pattern = "increasing_across_requested_horizons"
+        elif position_rms_values[-1] < position_rms_values[0] * 0.95:
+            divergence_pattern = "decreasing_across_requested_horizons"
+        else:
+            divergence_pattern = "approximately_flat_across_requested_horizons"
+    else:
+        divergence_pattern = "insufficient_comparable_horizons"
+
+    metadata_complete = len(quality["missing_provenance_fields"]) == 0
+    fresh = quality["epoch_age_hours"] <= req.stale_after_hours and quality["epoch_age_hours"] >= -1.0
+    evidence_gaps = [
+        "ไม่มี covariance matrix จากผู้ให้บริการวงโคจร",
+        "ไม่มี truth ephemeris หรือ residuals จากการติดตามอิสระ",
+        "ไม่สามารถยืนยันความเป็นอิสระของ OMM snapshots จาก provenance เพียงอย่างเดียว",
+        "ยังไม่ได้ประเมินพารามิเตอร์กายภาพและความไม่แน่นอนของวัตถุสำหรับ re-entry",
+    ]
+    return {
+        "api_version": APP_VERSION,
+        "catalog_id": history["catalog_id"],
+        "assessment_type": "descriptive_orbit_prediction_reliability_evidence",
+        "evidence_status": "limited" if fresh and metadata_complete else "review_required",
+        "latest_omm_quality_screen": quality,
+        "snapshot_count": history["record_count"],
+        "adjacent_comparison_count": history["comparison_count"],
+        "divergence_pattern": divergence_pattern,
+        "empirical_disagreement_by_horizon": list(by_horizon.values()),
+        "reentry_readiness": "not_assessed_insufficient_uncertainty_and_independent_tracking_evidence",
+        "evidence_gaps": evidence_gaps,
+        "interpretation": (
+            "รายงานนี้สรุปความไม่ตรงกันเชิงประจักษ์ระหว่าง OMM snapshots ที่ propagate ด้วย SGP4 "
+            "ใช้เป็นสัญญาณเตือนและติดตามแนวโน้มเท่านั้น ไม่ใช่ขอบเขตความเชื่อมั่นหรือค่าความคลาดเคลื่อนจริง"
+        ),
+        "limitations": [
+            "ค่ามากสุด/ RMS เป็นสถิติของความต่างระหว่าง catalog solutions ในชุดข้อมูลที่ส่งมา ไม่ใช่ uncertainty covariance",
+            "แนวโน้มขึ้นกับจำนวน snapshots, ระยะห่าง epochs และ horizons ที่ผู้ใช้เลือก",
+            "ห้ามตีความเป็นเปอร์เซ็นต์ความแม่นยำหรือความน่าจะเป็นที่วัตถุจะตก ณ ตำแหน่งใด",
+            "การประเมิน re-entry ต้องใช้แบบจำลองพลวัต/บรรยากาศและข้อมูลวัตถุเพิ่มเติม พร้อม validation กับข้อมูลอิสระ",
         ],
     }
 

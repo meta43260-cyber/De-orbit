@@ -160,7 +160,7 @@ body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-
           <button type="button" id="fetchCloudTleBtn" onclick="if(typeof window.fetchCloudTLE==='function'){document.getElementById('cloudTleInfo').textContent='กำลังเริ่มเรียก Backend…';window.fetchCloudTLE();}else{document.getElementById('cloudTleInfo').textContent='JavaScript ยังไม่พร้อม กรุณารีเฟรชหน้าเว็บ';}" class="bg-blue-600 px-3 py-2 rounded-lg text-sm whitespace-nowrap">ดึง OMM / TLE</button>
         </div>
         <div id="cloudTleInfo" class="text-xs text-gray-300" aria-live="polite">ยังไม่ได้ดึง OMM จาก Backend</div>
-        <p class="text-xs text-gray-500">ข้อมูล OMM จะตรวจสอบ Catalog ID, Epoch และองค์ประกอบวงโคจร; ถ้าเป็น ID 1–99999 จะสร้าง TLE สำหรับโมดูลเดิมด้วย</p>
+        <p class="text-xs text-gray-500">ข้อมูล OMM จะตรวจสอบ Catalog ID, Epoch และองค์ประกอบวงโคจร; ID 1–99999 ใช้ต่อกับโมดูลเดิมได้ ส่วน ID 6 หลักใช้ Cloud Simulation (กราฟวงโคจรเดิมยังไม่รองรับ)</p>
       </div>
       <div class="grid grid-cols-2 gap-2">
         <label class="text-xs text-gray-300">มวลวัตถุ (kg)

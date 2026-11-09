@@ -52,7 +52,7 @@ function collectCatalogRecord(id,record){
   const arr=loadLocalHist(id);
   const epoch=Number(record.epoch);
   if(!Number.isFinite(epoch))throw new Error('OMM Epoch ไม่ถูกต้อง');
-  const index=arr.findIndex(x=>Math.abs(Number(x.epoch)-epoch)<1000);
+  const index=arr.findIndex(x=>Math.abs(Number(x.epoch)-epoch)<HOUR);
   if(index>=0)arr[index]=Object.assign({},arr[index],record,{epoch:epoch});
   else arr.push(Object.assign({},record,{epoch:epoch}));
   arr.sort((a,b)=>a.epoch-b.epoch);

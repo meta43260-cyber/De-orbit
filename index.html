@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="theme-color" content="#0c1445">
-<title>Thai Re-entry Predictor v5.1 Multi-source Alpha</title>
+<title>Thai Re-entry Predictor v5.2 Unified TLE/OMM Alpha</title>
 <script src="https://cdn.tailwindcss.com/3.4.17"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -30,7 +30,7 @@ body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-
       <div class="w-12 h-12 bg-blue-500 rounded-full flex items-center justify-center pulse text-2xl">🛰️</div>
       <div>
         <h1 class="text-xl font-bold neon">Re-entry Predictor</h1>
-        <p class="text-xs text-blue-200">v5.1 Multi-source Alpha | <span id="status" class="text-yellow-400">กำลังโหลด...</span></p>
+        <p class="text-xs text-blue-200">v5.2 Unified TLE/OMM Alpha | <span id="status" class="text-yellow-400">กำลังโหลด...</span></p>
       </div>
     </div>
     <button onclick="refreshAll(true)" aria-label="อัปเดตข้อมูล" class="glass px-3 py-2 rounded-lg text-sm">🔄</button>
@@ -154,13 +154,13 @@ body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-
       <input id="apiBaseUrl" type="url" placeholder="https://your-service.onrender.com" class="w-full bg-gray-800 rounded-lg p-2 text-white text-sm">
       <p class="text-xs text-gray-500">ใส่ URL หลัง Deploy Backend สำเร็จ เช่น https://thai-reentry-predictor-api.onrender.com</p>
       <div class="rounded-lg border border-blue-400/30 bg-blue-950/40 p-3 space-y-2">
-        <h4 class="text-sm font-semibold text-blue-200">📡 ดึง TLE ล่าสุดอัตโนมัติ</h4>
+        <h4 class="text-sm font-semibold text-blue-200">📡 Unified TLE / OMM Catalog</h4>
         <div class="flex gap-2">
-          <input id="cloudNoradInput" type="number" inputmode="numeric" min="1" max="99999" placeholder="NORAD ID เช่น 25544" class="min-w-0 flex-1 bg-gray-800 rounded-lg p-2 text-white text-sm">
-          <button type="button" id="fetchCloudTleBtn" onclick="if(typeof window.fetchCloudTLE==='function'){document.getElementById('cloudTleInfo').textContent='กำลังเริ่มเรียก Backend…';window.fetchCloudTLE();}else{document.getElementById('cloudTleInfo').textContent='JavaScript ยังไม่พร้อม กรุณารีเฟรชหน้าเว็บ';}" class="bg-blue-600 px-3 py-2 rounded-lg text-sm whitespace-nowrap">ดึง TLE</button>
+          <input id="cloudNoradInput" type="number" inputmode="numeric" min="1" max="999999" placeholder="Catalog ID เช่น 25544 หรือ 60000" class="min-w-0 flex-1 bg-gray-800 rounded-lg p-2 text-white text-sm">
+          <button type="button" id="fetchCloudTleBtn" onclick="if(typeof window.fetchCloudTLE==='function'){document.getElementById('cloudTleInfo').textContent='กำลังเริ่มเรียก Backend…';window.fetchCloudTLE();}else{document.getElementById('cloudTleInfo').textContent='JavaScript ยังไม่พร้อม กรุณารีเฟรชหน้าเว็บ';}" class="bg-blue-600 px-3 py-2 rounded-lg text-sm whitespace-nowrap">ดึง OMM / TLE</button>
         </div>
-        <div id="cloudTleInfo" class="text-xs text-gray-300" aria-live="polite">ยังไม่ได้ดึง TLE จาก Backend</div>
-        <p class="text-xs text-gray-500">ข้อมูลจะถูกตรวจสอบ checksum และ Epoch ก่อนนำไปจำลอง ไม่ต้องคัดลอก TLE เอง</p>
+        <div id="cloudTleInfo" class="text-xs text-gray-300" aria-live="polite">ยังไม่ได้ดึง OMM จาก Backend</div>
+        <p class="text-xs text-gray-500">ข้อมูล OMM จะตรวจสอบ Catalog ID, Epoch และองค์ประกอบวงโคจร; ถ้าเป็น ID 1–99999 จะสร้าง TLE สำหรับโมดูลเดิมด้วย</p>
       </div>
       <div class="grid grid-cols-2 gap-2">
         <label class="text-xs text-gray-300">มวลวัตถุ (kg)

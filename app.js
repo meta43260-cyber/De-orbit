@@ -674,7 +674,7 @@ async function runCloudSimulation(){
     for(const k of ['mass_kg','reference_area_m2','drag_coefficient','nose_radius_m','f107_sfu','f107a_sfu','ap']){
       if(!Number.isFinite(payload[k]))throw new Error('กรุณาตรวจสอบค่าพารามิเตอร์การจำลอง');
     }
-    status.textContent='กำลังส่ง TLE ของ '+cloudTle.name+' (#'+cloudTle.norad_id+') ไปยัง Cloud และคำนวณ…';
+    status.textContent='กำลังส่ง OMM/TLE ของ '+cloudTle.name+' (#'+cloudTle.norad_id+') ไปยัง Cloud และคำนวณ…';
     const controller=new AbortController();
     const timer=setTimeout(()=>controller.abort(),180000);
     let response;

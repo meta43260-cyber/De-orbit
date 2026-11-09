@@ -555,11 +555,11 @@ function tleAgeLabel(epoch){
 async function fetchCloudTLE(){
   const btn=document.getElementById('fetchCloudTleBtn');
   const status=document.getElementById('simRunStatus');
-  const base=document.getElementById('apiBaseUrl').value.trim().replace(/\\/+$/,'');
+  const base=document.getElementById('apiBaseUrl').value.trim().replace(/\/+$/,'');
   const id=String(document.getElementById('cloudNoradInput').value||document.getElementById('noradInput').value||curNorad||'').trim();
   try{
     if(!base)throw new Error('กรุณาใส่ Backend API URL จาก Render ก่อน');
-    if(!/^\\d{1,6}$/.test(id)||Number(id)<1)throw new Error('กรุณากรอก NORAD ID ตั้งแต่ 1 ถึง 999999');
+    if(!/^\d{1,6}$/.test(id)||Number(id)<1)throw new Error('กรุณากรอก NORAD ID ตั้งแต่ 1 ถึง 999999');
     localStorage.setItem('reentryApiBase',base);
     btn.disabled=true;btn.classList.add('opacity-50');
     setCloudTleInfo('กำลังติดต่อ Backend… หาก Render เพิ่งพักบริการ อาจใช้เวลาเริ่มระบบ 30–60 วินาที','text-yellow-300');

@@ -95,6 +95,15 @@ class LongTermValidationRequest(BaseModel):
 class BatchValidationRequest(BaseModel):
     catalog_ids: list[int] = Field(min_length=1, max_length=8)
 
+class AtmosphereSensitivityRequest(BaseModel):
+    time_utc: datetime
+    latitude_deg: float = Field(ge=-90, le=90)
+    longitude_deg: float = Field(ge=-180, le=180)
+    altitudes_km: list[float] = Field(default=[80, 100, 120, 150, 200, 300], min_length=1, max_length=12)
+    baseline_f107_sfu: float = Field(default=150.0, ge=50, le=400)
+    baseline_f107a_sfu: float = Field(default=150.0, ge=50, le=400)
+    baseline_ap: float = Field(default=15.0, ge=0, le=400)
+
 
 def as_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
@@ -1139,6 +1148,56 @@ def validate_batch(req: BatchValidationRequest):
         "results": results,
         "source_note": "Batch นี้ทดสอบความสอดคล้องของ OMM/TLE จาก catalog feed ไม่ใช่การเทียบกับเครือข่ายติดตามอิสระ",
     }
+
+
+
+@app.post("/api/v1/validate/atmosphere-sensitivity")
+def validate_atmosphere_sensitivity(req: AtmosphereSensitivityRequest):
+    """Compare NRLMSISE-00 density under explicitly defined quiet, baseline and active space-weather scenarios."""
+    altitudes = sorted(set(float(x) for x in req.altitudes_km))
+    if any(not math.isfinite(x) or x < 80 or x > 1000 for x in altitudes):
+        raise HTTPException(status_code=422, detail="altitudes_km ต้องอยู่ระหว่าง 80 ถึง 1000 km")
+    scenarios = {
+        "quiet": {"f107": 70.0, "f107a": 70.0, "ap": 4.0},
+        "baseline": {"f107": req.baseline_f107_sfu, "f107a": req.baseline_f107a_sfu,
+                     "ap": req.baseline_ap},
+        "active": {"f107": 250.0, "f107a": 200.0, "ap": 100.0},
+    }
+    results = {}
+    try:
+        for name, values in scenarios.items():
+            rows = []
+            for altitude in altitudes:
+                model_req = AtmosphereRequest(
+                    time_utc=req.time_utc, latitude_deg=req.latitude_deg,
+                    longitude_deg=req.longitude_deg, altitude_km=altitude,
+                    f107_sfu=values["f107"], f107a_sfu=values["f107a"], ap=values["ap"],
+                )
+                rho, temp = msis_density(as_utc(req.time_utc), req.latitude_deg,
+                                          req.longitude_deg, altitude, model_req)
+                rows.append({"altitude_km": altitude, "density_kg_m3": rho, "temperature_K": temp})
+            results[name] = {"inputs": values, "profile": rows}
+        baseline = {row["altitude_km"]: row["density_kg_m3"] for row in results["baseline"]["profile"]}
+        for name in ("quiet", "active"):
+            for row in results[name]["profile"]:
+                ref = baseline[row["altitude_km"]]
+                row["density_ratio_vs_baseline"] = row["density_kg_m3"] / ref if ref > 0 else None
+        return {
+            "api_version": APP_VERSION, "model": "NRLMSISE-00",
+            "time_utc": as_utc(req.time_utc).isoformat(),
+            "location": {"latitude_deg": req.latitude_deg, "longitude_deg": req.longitude_deg},
+            "scenarios": results,
+            "interpretation": "เปรียบเทียบความไวของความหนาแน่นบรรยากาศต่อชุดค่า F10.7/F10.7a/Ap ที่กำหนด ไม่ใช่การจำลองการกลับเข้าสู่บรรยากาศทั้งวิถี",
+            "limitations": [
+                "quiet และ active เป็นกรณีสมมติ ไม่ใช่ข้อมูล space weather ที่วัดได้ ณ เวลานั้น",
+                "ผลขึ้นกับตำแหน่ง เวลา และความสูงที่ส่งเข้ามา",
+                "ยังไม่รวมลมบรรยากาศ การแตกตัว การระเหย หรือการเปลี่ยนพื้นที่หน้าตัดของวัตถุ",
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Atmosphere sensitivity calculation failed: {exc}") from exc
 
 
 @app.post("/api/v1/simulate")

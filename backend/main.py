@@ -29,7 +29,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "6.3.0-backup-integrity-recovery"
+APP_VERSION = "6.4.0-offline-omm-ingestion"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -40,9 +40,9 @@ ENTRY_ALT_DEFAULT_KM = 120.0
 MSIS_VERSION = 0             # NRLMSISE-00 (not MSIS 2.x)
 
 app = FastAPI(
-    title="Thai Re-entry Predictor API v6.3",
+    title="Thai Re-entry Predictor API v6.4",
     version=APP_VERSION,
-    description="Advanced phone-cloud orbital decay, verified OMM archive backup and controlled recovery API; research prototype, not an operational forecast.",
+    description="Advanced phone-cloud orbital decay, offline OMM ingestion, verified archive backup and controlled recovery API; research prototype, not an operational forecast.",
 )
 
 origins = os.getenv("ALLOWED_ORIGINS", "*")
@@ -748,6 +748,20 @@ def _history_db():
             CREATE INDEX IF NOT EXISTS idx_omm_history_records_catalog_epoch
             ON omm_history_records (catalog_id, epoch_utc DESC)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS omm_offline_records (
+                catalog_id BIGINT NOT NULL,
+                epoch_utc TEXT NOT NULL,
+                source TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                imported_at_utc TEXT NOT NULL,
+                PRIMARY KEY (catalog_id, epoch_utc, source)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_omm_offline_records_catalog_epoch
+            ON omm_offline_records (catalog_id, epoch_utc DESC)
+        """)
         conn.commit()
         return conn
     except Exception:
@@ -762,6 +776,195 @@ def _history_storage_info():
         "persistence": "external_managed_database",
         "note": "Historical OMM records and fetch state are stored outside the Render service filesystem."
     }
+
+
+def _validate_offline_omm_document(document: dict) -> tuple[str, list]:
+    """Validate offline OMM imports without making any network requests."""
+    if not isinstance(document, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+    source = document.get("source")
+    if source not in ("synthetic_test", "user_supplied"):
+        raise HTTPException(status_code=422, detail="source ต้องเป็น synthetic_test หรือ user_supplied")
+    records = document.get("records")
+    if not isinstance(records, list) or not 1 <= len(records) <= 200:
+        raise HTTPException(status_code=422, detail="records ต้องเป็น array จำนวน 1–200 รายการ")
+
+    required = (
+        "EPOCH", "NORAD_CAT_ID", "MEAN_MOTION", "ECCENTRICITY",
+        "INCLINATION", "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY"
+    )
+    seen = set()
+    normalized = []
+    for index, raw in enumerate(records):
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=422, detail=f"records[{index}] ต้องเป็น object")
+        fields = {str(k).upper(): v for k, v in raw.items()}
+        missing = [key for key in required if fields.get(key) is None]
+        if missing:
+            raise HTTPException(status_code=422, detail={
+                "message": f"records[{index}] ขาด OMM fields ที่จำเป็น",
+                "missing_fields": missing
+            })
+        try:
+            catalog_id = int(fields["NORAD_CAT_ID"])
+            epoch_raw = str(fields["EPOCH"])
+            epoch_dt = datetime.fromisoformat(epoch_raw.replace("Z", "+00:00"))
+            epoch_dt = as_utc(epoch_dt)
+            epoch = epoch_dt.isoformat()
+            numeric = {
+                key: float(fields[key]) for key in (
+                    "MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
+                    "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY"
+                )
+            }
+            bstar = float(fields.get("BSTAR", 0.0) or 0.0)
+            mm_dot = float(fields.get("MEAN_MOTION_DOT", 0.0) or 0.0)
+            mm_ddot = float(fields.get("MEAN_MOTION_DDOT", 0.0) or 0.0)
+            if not 1 <= catalog_id <= 999999:
+                raise ValueError("NORAD_CAT_ID ต้องอยู่ในช่วง 1–999999")
+            if not all(math.isfinite(v) for v in [*numeric.values(), bstar, mm_dot, mm_ddot]):
+                raise ValueError("OMM numeric fields ต้องเป็น finite numbers")
+            if not 0.0 < numeric["MEAN_MOTION"] < 20.0:
+                raise ValueError("MEAN_MOTION ต้องอยู่ในช่วง 0–20 rev/day")
+            if not 0.0 <= numeric["ECCENTRICITY"] < 1.0:
+                raise ValueError("ECCENTRICITY ต้องอยู่ในช่วง 0–1")
+            if not 0.0 <= numeric["INCLINATION"] <= 180.0:
+                raise ValueError("INCLINATION ต้องอยู่ในช่วง 0–180 degrees")
+            if any(not 0.0 <= numeric[k] < 360.0 for k in (
+                "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY"
+            )):
+                raise ValueError("มุม RA_OF_ASC_NODE, ARG_OF_PERICENTER และ MEAN_ANOMALY ต้องอยู่ในช่วง 0–360")
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"OMM records[{index}] ไม่ถูกต้อง: {exc}") from exc
+
+        if catalog_id != int(str({str(k).upper(): v for k, v in records[0].items()}.get("NORAD_CAT_ID", 0))):
+            raise HTTPException(status_code=422, detail="OMM ทุกชุดต้องเป็น NORAD_CAT_ID เดียวกัน")
+        key = (catalog_id, epoch)
+        if key in seen:
+            raise HTTPException(status_code=422, detail=f"พบ NORAD_CAT_ID/EPOCH ซ้ำใน records[{index}]")
+        seen.add(key)
+        fields["NORAD_CAT_ID"] = str(catalog_id)
+        fields["EPOCH"] = epoch
+        fields.setdefault("BSTAR", str(bstar))
+        fields.setdefault("MEAN_MOTION_DOT", str(mm_dot))
+        fields.setdefault("MEAN_MOTION_DDOT", str(mm_ddot))
+        normalized.append({"catalog_id": catalog_id, "epoch_utc": epoch, "payload": fields})
+
+    return source, normalized
+
+
+@app.post("/api/v1/v6/omm/import/validate")
+def v6_offline_omm_validate(document: dict):
+    """Validate offline OMM JSON; no database writes and no network calls."""
+    source, records = _validate_offline_omm_document(document)
+    return {
+        "api_version": APP_VERSION,
+        "status": "valid",
+        "source": source,
+        "record_count": len(records),
+        "catalog_id": records[0]["catalog_id"],
+        "epochs_utc": [x["epoch_utc"] for x in records],
+        "database_modified": False,
+        "gp_history_requested": False,
+        "note": "Validation only. No Space-Track or other external request was made."
+    }
+
+
+@app.post("/api/v1/v6/omm/import")
+def v6_offline_omm_import(document: dict):
+    """Import supplied OMM records into a separate offline table; never calls Space-Track."""
+    source, records = _validate_offline_omm_document(document)
+    imported_at = datetime.now(timezone.utc).isoformat()
+    try:
+        conn = _history_db()
+        inserted = 0
+        try:
+            with conn.transaction():
+                for item in records:
+                    result = conn.execute("""
+                        INSERT INTO omm_offline_records
+                        (catalog_id,epoch_utc,source,payload_json,imported_at_utc)
+                        VALUES(%s,%s,%s,%s,%s)
+                        ON CONFLICT (catalog_id,epoch_utc,source) DO NOTHING
+                        RETURNING catalog_id
+                    """, (
+                        item["catalog_id"], item["epoch_utc"], source,
+                        json.dumps(item["payload"], separators=(",", ":"), ensure_ascii=False),
+                        imported_at
+                    ))
+                    if result.fetchone() is not None:
+                        inserted += 1
+        finally:
+            conn.close()
+        return {
+            "api_version": APP_VERSION,
+            "status": "imported" if inserted else "already_present",
+            "source": source,
+            "catalog_id": records[0]["catalog_id"],
+            "submitted_count": len(records),
+            "inserted_count": inserted,
+            "duplicate_count": len(records) - inserted,
+            "database": "PostgreSQL",
+            "database_modified": bool(inserted),
+            "gp_history_requested": False,
+            "note": "Offline import stored separately from Space-Track GP_HISTORY records."
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "status": "import_failed",
+            "error": str(exc)[:240],
+            "gp_history_requested": False
+        }) from exc
+
+
+@app.get("/api/v1/v6/omm/archive")
+def v6_offline_omm_archive(catalog_id: Optional[int] = None, limit: int = 100):
+    """Read offline-imported OMM records only; does not contact Space-Track."""
+    if catalog_id is not None and not 1 <= catalog_id <= 999999:
+        raise HTTPException(status_code=422, detail="catalog_id ต้องอยู่ในช่วง 1–999999")
+    if not 1 <= limit <= 500:
+        raise HTTPException(status_code=422, detail="limit ต้องอยู่ระหว่าง 1 ถึง 500")
+    try:
+        conn = _history_db()
+        try:
+            if catalog_id is None:
+                rows = conn.execute("""
+                    SELECT catalog_id,epoch_utc,source,payload_json,imported_at_utc
+                    FROM omm_offline_records ORDER BY epoch_utc DESC LIMIT %s
+                """, (limit,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT catalog_id,epoch_utc,source,payload_json,imported_at_utc
+                    FROM omm_offline_records WHERE catalog_id=%s
+                    ORDER BY epoch_utc DESC LIMIT %s
+                """, (catalog_id, limit)).fetchall()
+            total = conn.execute("SELECT COUNT(*) AS count FROM omm_offline_records").fetchone()["count"]
+        finally:
+            conn.close()
+        return {
+            "api_version": APP_VERSION,
+            "status": "ok",
+            "archive_type": "offline_imports",
+            "total_record_count": int(total),
+            "returned_record_count": len(rows),
+            "records": [{
+                "catalog_id": row["catalog_id"],
+                "epoch_utc": row["epoch_utc"],
+                "source": row["source"],
+                "payload": json.loads(row["payload_json"]),
+                "imported_at_utc": row["imported_at_utc"]
+            } for row in rows],
+            "gp_history_requested": False,
+            "note": "This endpoint reads only the separate offline-import table; no Space-Track request is made."
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "status": "archive_read_failed",
+            "error": str(exc)[:240],
+            "gp_history_requested": False
+        }) from exc
 
 
 @app.get("/api/v1/v6/storage/check")

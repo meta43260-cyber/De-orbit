@@ -175,12 +175,16 @@ def find_entry_state(req: SimulationRequest, sat: Satrec):
                 status_code=422,
                 detail=f"TLE ณ entry_time อยู่ที่ {geo[2]:.1f} km; ต้องอยู่ในช่วง 70–180 km เพื่อเริ่มจำลอง",
             )
+        if float(np.dot(r, v)) >= 0.0:
+            raise HTTPException(status_code=422, detail="สถานะ ณ entry_time ไม่ได้กำลังลดระดับลง")
         return entry_time, r, v, geo, "user_supplied_entry_time"
 
     prev_time = start
     prev = propagate_tle(sat, prev_time)
     prev_alt = prev[2][2]
     if 70.0 <= prev_alt <= 180.0:
+        if float(np.dot(prev[0], prev[1])) >= 0.0:
+            raise HTTPException(status_code=422, detail="วัตถุอยู่ในช่วงความสูง Re-entry แต่กำลังไต่ระดับขึ้น ไม่ใช่ขาลง")
         return prev_time, prev[0], prev[1], prev[2], "start_state_already_in_entry_region"
     if prev_alt < 70.0:
         raise HTTPException(status_code=422, detail="วัตถุต่ำกว่า 70 km แล้ว; ไม่สามารถเริ่มจาก entry interface ได้")

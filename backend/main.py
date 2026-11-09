@@ -11,6 +11,7 @@ import os
 import urllib.error
 import urllib.request
 import http.cookiejar
+import hashlib
 import urllib.parse
 import threading
 import time
@@ -27,7 +28,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "6.1.0-historical-omm-archive"
+APP_VERSION = "6.2.0-historical-archive-backup"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -38,7 +39,7 @@ ENTRY_ALT_DEFAULT_KM = 120.0
 MSIS_VERSION = 0             # NRLMSISE-00 (not MSIS 2.x)
 
 app = FastAPI(
-    title="Thai Re-entry Predictor API v6.1",
+    title="Thai Re-entry Predictor API v6.2",
     version=APP_VERSION,
     description="Advanced phone-cloud orbital decay, archived historical OMM and scenario-based re-entry analysis API; research prototype, not an operational forecast.",
 )
@@ -952,6 +953,116 @@ def get_omm_history(catalog_id: int, limit: int = 20):
             except Exception:
                 pass
         conn.close()
+
+
+@app.get("/api/v1/v6/backup/status")
+def v6_backup_status():
+    """Read-only summary of archive contents; does not contact Space-Track."""
+    try:
+        conn = _history_db()
+        try:
+            totals = conn.execute("""
+                SELECT COUNT(*) AS record_count,
+                       COUNT(DISTINCT catalog_id) AS catalog_count,
+                       MIN(epoch_utc) AS earliest_epoch_utc,
+                       MAX(epoch_utc) AS latest_epoch_utc
+                FROM omm_history_records
+            """).fetchone()
+            states = conn.execute("""
+                SELECT catalog_id, status, record_count, attempted_at_utc,
+                       completed_at_utc, error
+                FROM omm_history_fetches ORDER BY catalog_id
+            """).fetchall()
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "api_version": APP_VERSION,
+            "status": "ok",
+            "archive": dict(totals),
+            "fetch_states": [dict(row) for row in states],
+            "gp_history_requested": False,
+            "note": "Read-only database inspection; no Space-Track request is made."
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "status": "unavailable", "error": str(exc)[:200],
+            "gp_history_requested": False
+        }) from exc
+
+
+@app.get("/api/v1/v6/backup/export")
+def v6_backup_export(catalog_id: Optional[int] = None):
+    """Export archived OMM and fetch-state metadata as a checksummed JSON document."""
+    if catalog_id is not None and not 1 <= catalog_id <= 999999:
+        raise HTTPException(status_code=422, detail="Catalog ID ต้องอยู่ในช่วง 1–999999")
+    try:
+        conn = _history_db()
+        try:
+            if catalog_id is None:
+                fetch_rows = conn.execute("""
+                    SELECT catalog_id, status, attempted_at_utc, completed_at_utc,
+                           record_count, error
+                    FROM omm_history_fetches ORDER BY catalog_id
+                """).fetchall()
+                record_rows = conn.execute("""
+                    SELECT catalog_id, epoch_utc, creation_date, source, payload_json
+                    FROM omm_history_records ORDER BY catalog_id, epoch_utc
+                """).fetchall()
+            else:
+                fetch_rows = conn.execute("""
+                    SELECT catalog_id, status, attempted_at_utc, completed_at_utc,
+                           record_count, error
+                    FROM omm_history_fetches WHERE catalog_id=%s
+                """, (catalog_id,)).fetchall()
+                record_rows = conn.execute("""
+                    SELECT catalog_id, epoch_utc, creation_date, source, payload_json
+                    FROM omm_history_records WHERE catalog_id=%s ORDER BY epoch_utc
+                """, (catalog_id,)).fetchall()
+            conn.commit()
+        finally:
+            conn.close()
+
+        records = [{
+            "catalog_id": row["catalog_id"],
+            "epoch_utc": row["epoch_utc"],
+            "creation_date": row["creation_date"],
+            "source": row["source"],
+            "payload": json.loads(row["payload_json"])
+        } for row in record_rows]
+        fetch_states = [dict(row) for row in fetch_rows]
+        digest_input = json.dumps(
+            {"fetch_states": fetch_states, "records": records},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return {
+            "backup_format": "thai-reentry-predictor-omm-archive",
+            "backup_schema_version": 1,
+            "api_version": APP_VERSION,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "catalog_id_filter": catalog_id,
+            "fetch_state_count": len(fetch_states),
+            "record_count": len(records),
+            "sha256": hashlib.sha256(digest_input).hexdigest(),
+            "fetch_states": fetch_states,
+            "records": records,
+            "verification": {
+                "algorithm": "SHA-256",
+                "canonicalization": "UTF-8 JSON; sorted keys; compact separators; hash covers fetch_states and records",
+                "restore_endpoint_available": False
+            },
+            "limitations": [
+                "This export is a backup copy, not an independent validation of the source orbital data.",
+                "No Space-Track request is made by this endpoint.",
+                "Restore/import is intentionally not enabled until an authenticated restore workflow is implemented."
+            ]
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "status": "backup_export_failed", "error": str(exc)[:200],
+            "gp_history_requested": False
+        }) from exc
+
 
 
 # OMM catalog feed: accepts five- and six-digit catalog IDs and preserves full OMM fields.

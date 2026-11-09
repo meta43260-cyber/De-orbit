@@ -27,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.7.0-epoch-comparison"
+APP_VERSION = "5.8.0-data-quality-history"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -90,6 +90,17 @@ class SGP4ValidationRequest(BaseModel):
 class LongTermValidationRequest(BaseModel):
     omm_fields: dict
     offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0], min_length=1, max_length=12)
+
+
+class OMMQualityRequest(BaseModel):
+    omm_fields: dict
+    reference_time_utc: Optional[datetime] = None
+    stale_after_hours: float = Field(default=24.0, ge=1.0, le=720.0)
+
+
+class HistoricalOMMSeriesRequest(BaseModel):
+    omm_records: list[dict] = Field(min_length=2, max_length=12)
+    offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0, 48.0, 72.0, 168.0], min_length=1, max_length=12)
 
 
 class LatestEpochComparisonRequest(BaseModel):
@@ -1258,6 +1269,160 @@ def validate_epoch_comparison(req: EpochComparisonValidationRequest):
             "ความแตกต่างระหว่างสองคำตอบไม่ใช่ absolute orbit error เพราะไม่มี truth ephemeris หรือข้อมูลสังเกตอิสระ",
             "การ propagate ทั้งสองชุดใช้แบบจำลอง SGP4; ผลอาจได้รับผลจากความไม่แน่นอนของ BSTAR และแรงรบกวน",
             "ผลนี้ไม่ใช่การรับรองความแม่นยำของการทำนาย re-entry",
+        ],
+    }
+
+
+@app.post("/api/v1/validate/omm-quality")
+def validate_omm_quality(req: OMMQualityRequest):
+    """Screen one OMM record for metadata completeness, numerical plausibility and epoch freshness."""
+    fields = {str(k).upper(): v for k, v in req.omm_fields.items()}
+    required = ("NORAD_CAT_ID", "EPOCH", "MEAN_MOTION", "ECCENTRICITY", "INCLINATION",
+                "RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY")
+    missing = [key for key in required if fields.get(key) in (None, "")]
+    if missing:
+        raise HTTPException(status_code=422, detail={"message": "OMM fields missing", "fields": missing})
+    try:
+        catalog_id = int(fields["NORAD_CAT_ID"])
+        epoch = as_utc(datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00")))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid NORAD_CAT_ID or EPOCH: {exc}") from exc
+    if not 1 <= catalog_id <= 999999:
+        raise HTTPException(status_code=422, detail="NORAD_CAT_ID ต้องอยู่ในช่วง 1–999999")
+
+    numeric_fields = ("MEAN_MOTION", "ECCENTRICITY", "INCLINATION", "RA_OF_ASC_NODE",
+                      "ARG_OF_PERICENTER", "MEAN_ANOMALY", "BSTAR",
+                      "MEAN_MOTION_DOT", "MEAN_MOTION_DDOT")
+    numeric = {}
+    for key in numeric_fields:
+        if fields.get(key) in (None, ""):
+            if key in ("BSTAR", "MEAN_MOTION_DOT", "MEAN_MOTION_DDOT"):
+                continue
+            raise HTTPException(status_code=422, detail=f"Missing numeric OMM field: {key}")
+        try:
+            numeric[key] = float(fields[key])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid numeric OMM field: {key}") from exc
+        if not math.isfinite(numeric[key]):
+            raise HTTPException(status_code=422, detail=f"Non-finite OMM field: {key}")
+
+    checks = {
+        "mean_motion": 0.0 < numeric["MEAN_MOTION"] < 20.0,
+        "eccentricity": 0.0 <= numeric["ECCENTRICITY"] < 1.0,
+        "inclination": 0.0 <= numeric["INCLINATION"] <= 180.0,
+        "angular_elements_finite": all(math.isfinite(numeric[k]) for k in
+            ("RA_OF_ASC_NODE", "ARG_OF_PERICENTER", "MEAN_ANOMALY")),
+    }
+    if not all(checks.values()):
+        raise HTTPException(status_code=422, detail={"message": "OMM orbital elements failed plausibility checks", "checks": checks})
+
+    reference_time = as_utc(req.reference_time_utc or datetime.now(timezone.utc))
+    age_hours = (reference_time - epoch).total_seconds() / 3600.0
+    warnings = []
+    if age_hours < -1.0:
+        warnings.append("OMM EPOCH is more than one hour in the future relative to reference_time_utc")
+    elif age_hours > req.stale_after_hours:
+        warnings.append(f"OMM is older than the configured freshness threshold ({req.stale_after_hours:g} hours)")
+    if age_hours > 72.0:
+        warnings.append("OMM EPOCH is older than 72 hours")
+    provenance = {
+        "originator": fields.get("ORIGINATOR"),
+        "creation_date": fields.get("CREATION_DATE"),
+        "gp_id": fields.get("GP_ID"),
+        "object_id": fields.get("OBJECT_ID"),
+        "classification_type": fields.get("CLASSIFICATION_TYPE"),
+    }
+    missing_provenance = [key for key, value in provenance.items() if value in (None, "")]
+    if missing_provenance:
+        warnings.append("Some provenance metadata fields are absent; traceability is limited")
+
+    return {
+        "api_version": APP_VERSION,
+        "catalog_id": catalog_id,
+        "object_name": fields.get("OBJECT_NAME"),
+        "epoch_utc": epoch.isoformat(),
+        "reference_time_utc": reference_time.isoformat(),
+        "epoch_age_hours": round(age_hours, 3),
+        "freshness_threshold_hours": req.stale_after_hours,
+        "quality_screen": "review_required" if warnings else "passed",
+        "checks": checks,
+        "numeric_elements": numeric,
+        "provenance": provenance,
+        "missing_provenance_fields": missing_provenance,
+        "warnings": warnings,
+        "interpretation": "เป็นการคัดกรองความสมบูรณ์ ความสมเหตุสมผลเชิงตัวเลข และอายุข้อมูลเท่านั้น ไม่ใช่การยืนยันความแม่นยำของวงโคจร",
+        "limitations": [
+            "BSTAR ไม่มีเกณฑ์ผ่าน/ไม่ผ่านแบบสากลใน endpoint นี้; ค่าขึ้นกับวัตถุและการ fit ของ catalog",
+            "ความสดใหม่ของ EPOCH ไม่เท่ากับความแม่นยำของวงโคจร",
+            "การมี provenance ไม่ได้พิสูจน์ว่าแหล่งข้อมูลเป็นอิสระจากเครือข่ายอื่น",
+            "ไม่มี truth ephemeris หรือ observation residuals สำหรับคำนวณ absolute orbit error",
+        ],
+    }
+
+
+@app.post("/api/v1/validate/historical-series")
+def validate_historical_omm_series(req: HistoricalOMMSeriesRequest):
+    """Compare a chronological sequence of saved OMM snapshots using adjacent-epoch disagreements."""
+    prepared = []
+    for index, raw in enumerate(req.omm_records):
+        fields = {str(k).upper(): v for k, v in raw.items()}
+        try:
+            catalog_id = int(fields.get("NORAD_CAT_ID", 0))
+            epoch = as_utc(datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00")))
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"omm_records[{index}] requires valid NORAD_CAT_ID and EPOCH: {exc}") from exc
+        if not 1 <= catalog_id <= 999999:
+            raise HTTPException(status_code=422, detail=f"omm_records[{index}] has invalid NORAD_CAT_ID")
+        prepared.append({"catalog_id": catalog_id, "epoch": epoch, "fields": raw})
+
+    catalog_ids = {item["catalog_id"] for item in prepared}
+    if len(catalog_ids) != 1:
+        raise HTTPException(status_code=422, detail="OMM records ต้องเป็นวัตถุ NORAD_CAT_ID เดียวกัน")
+    prepared.sort(key=lambda item: item["epoch"])
+    epochs = [item["epoch"] for item in prepared]
+    if len(set(epochs)) != len(epochs):
+        raise HTTPException(status_code=422, detail="OMM records ต้องมี EPOCH ไม่ซ้ำกัน")
+
+    comparisons = []
+    for index in range(len(prepared) - 1):
+        older, newer = prepared[index], prepared[index + 1]
+        comparison = validate_epoch_comparison(EpochComparisonValidationRequest(
+            older_omm_fields=older["fields"],
+            newer_omm_fields=newer["fields"],
+            offsets_hours=req.offsets_hours,
+        ))
+        comparisons.append({
+            "pair_index": index + 1,
+            "older_epoch_utc": comparison["older_epoch_utc"],
+            "newer_epoch_utc": comparison["newer_epoch_utc"],
+            "epoch_separation_hours": comparison["epoch_separation_hours"],
+            "position_disagreement_summary_km": comparison["position_disagreement_summary_km"],
+            "velocity_disagreement_summary_m_s": comparison["velocity_disagreement_summary_m_s"],
+            "samples": comparison["samples"],
+            "provenance": comparison["provenance"],
+            "comparison_status": comparison["comparison_status"],
+        })
+
+    return {
+        "api_version": APP_VERSION,
+        "catalog_id": prepared[0]["catalog_id"],
+        "test_type": "historical_adjacent_omm_solution_disagreement",
+        "record_count": len(prepared),
+        "comparison_count": len(comparisons),
+        "records_chronological": [
+            {"epoch_utc": item["epoch"].isoformat(),
+             "originator": {str(k).upper(): v for k, v in item["fields"].items()}.get("ORIGINATOR"),
+             "creation_date": {str(k).upper(): v for k, v in item["fields"].items()}.get("CREATION_DATE"),
+             "gp_id": {str(k).upper(): v for k, v in item["fields"].items()}.get("GP_ID")}
+            for item in prepared
+        ],
+        "adjacent_comparisons": comparisons,
+        "interpretation": "แต่ละคู่เป็นความไม่ตรงกันของ OMM สอง Epoch ที่ propagate ไปยังเวลาเดียวกัน ไม่ใช่ absolute orbit error; ใช้ดูแนวโน้มการเปลี่ยนแปลงของ catalog solution เท่านั้น",
+        "limitations": [
+            "ต้องเก็บ OMM snapshots ไว้เองจากการเรียก API ในเวลาต่างกัน; endpoint นี้ไม่สร้างประวัติย้อนหลังจาก Space-Track ให้อัตโนมัติ",
+            "OMM หลาย Epoch อาจมาจากเครือข่ายติดตามเดียวกันและไม่เป็นข้อมูลอิสระ",
+            "การเปรียบเทียบแต่ละคู่ใช้ SGP4/TEME และจำกัดช่วงห่างของ Epoch ตาม endpoint epoch-comparison",
+            "ผล disagreement ไม่ใช่ covariance, confidence interval หรือการรับรองความแม่นยำของ re-entry",
         ],
     }
 

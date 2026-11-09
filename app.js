@@ -610,8 +610,28 @@ async function fetchCloudTLE(){
     let response;
     try{response=await fetch(base+'/api/v1/omm/'+encodeURIComponent(id),{method:'GET',headers:{'Accept':'application/json'},signal:controller.signal});}
     finally{clearTimeout(timer);}
-    const data=await response.json().catch(()=>({}));
-    if(!response.ok)throw new Error((data.detail&&typeof data.detail==='object'?data.detail.message:data.detail)||('Backend ตอบ HTTP '+response.status));
+    let data=await response.json().catch(()=>({}));
+    if(!response.ok){
+      // Keep the existing workflow usable if OMM provider/export fails for a legacy 5-digit object.
+      if(Number(id)<=99999){
+        const fallback=await fetch(base+'/api/v1/tle/'+encodeURIComponent(id),{headers:{'Accept':'application/json'}});
+        const fd=await fallback.json().catch(()=>({}));
+        if(fallback.ok&&Number(fd.norad_id)===Number(id)&&validTLE(fd.line1,fd.line2,id)){
+          const fe=new Date(fd.epoch_utc||parseTLEEpoch(fd.line1)).getTime();
+          cloudTle={norad_id:Number(id),name:fd.name||('NORAD '+id),line1:fd.line1,line2:fd.line2,
+            omm_fields:null,format:'TLE fallback',epoch:fe,epoch_utc:fd.epoch_utc||new Date(fe).toISOString(),
+            source:fd.source||'Multi-source TLE fallback',source_url:fd.source_url||'',fetched_at_utc:fd.fetched_at_utc||new Date().toISOString()};
+          collectCatalogRecord(id,cloudTle);saveCache(id,cloudTle);
+          setCloudTleInfo('✓ '+cloudTle.name+' (#'+id+') · OMM endpoint ใช้งานไม่ได้ จึงใช้ TLE จาก Multi-source แทน · Epoch '+new Date(fe).toLocaleString('th-TH',{timeZone:'UTC'})+' UTC · ข้อมูลถูกบันทึกในประวัติเดิม','text-yellow-300');
+          if(status){status.textContent='รับ TLE สำรองแล้ว — บันทึกเข้าประวัติกลางและพร้อมจำลองบน Cloud';status.className='text-xs text-green-300';}
+          return;
+        }
+      }
+      const detail=data.detail;
+      const sourceErrors=detail&&typeof detail==='object'&&Array.isArray(detail.sources_checked)
+        ? detail.sources_checked.map(x=>x.source+': '+(x.error||x.status)).join(' | '):'';
+      throw new Error((detail&&typeof detail==='object'?detail.message:detail)||('Backend ตอบ HTTP '+response.status)+(sourceErrors?' · '+sourceErrors:''));
+    }
     if(Number(data.catalog_id)!==Number(id)||!data.omm_fields||!Number.isFinite(new Date(data.epoch_utc).getTime()))throw new Error('OMM ไม่ผ่านการตรวจสอบ Catalog ID หรือ Epoch');
     const epochMs=new Date(data.epoch_utc).getTime(),ex=data.tle_export||null;
     if(ex&&!validTLE(ex.line1,ex.line2,id))throw new Error('TLE export จาก OMM ไม่ผ่าน checksum');

@@ -157,7 +157,7 @@ body{background:linear-gradient(135deg,#0c1445 0%,#1a1a2e 50%,#16213e 100%);min-
         <h4 class="text-sm font-semibold text-blue-200">📡 ดึง TLE ล่าสุดอัตโนมัติ</h4>
         <div class="flex gap-2">
           <input id="cloudNoradInput" type="number" inputmode="numeric" min="1" max="999999" placeholder="NORAD ID เช่น 25544" class="min-w-0 flex-1 bg-gray-800 rounded-lg p-2 text-white text-sm">
-          <button id="fetchCloudTleBtn" onclick="fetchCloudTLE()" class="bg-blue-600 px-3 py-2 rounded-lg text-sm whitespace-nowrap">ดึง TLE</button>
+          <button type="button" id="fetchCloudTleBtn" onclick="if(typeof window.fetchCloudTLE==='function'){document.getElementById('cloudTleInfo').textContent='กำลังเริ่มเรียก Backend…';window.fetchCloudTLE();}else{document.getElementById('cloudTleInfo').textContent='JavaScript ยังไม่พร้อม กรุณารีเฟรชหน้าเว็บ';}" class="bg-blue-600 px-3 py-2 rounded-lg text-sm whitespace-nowrap">ดึง TLE</button>
         </div>
         <div id="cloudTleInfo" class="text-xs text-gray-300" aria-live="polite">ยังไม่ได้ดึง TLE จาก Backend</div>
         <p class="text-xs text-gray-500">ข้อมูลจะถูกตรวจสอบ checksum และ Epoch ก่อนนำไปจำลอง ไม่ต้องคัดลอก TLE เอง</p>

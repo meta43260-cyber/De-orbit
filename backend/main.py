@@ -707,6 +707,168 @@ def get_latest_tle(norad_id: int):
 
 
 
+# Historical OMM archive (GP_HISTORY). Space-Track permits one history retrieval
+# per object lifetime; persist the result and serve all later requests locally.
+import sqlite3
+
+HISTORY_DB_PATH = os.getenv("HISTORY_DB_PATH", "./data/omm_history.sqlite3")
+_HISTORY_FETCH_LOCK = threading.Lock()
+
+
+def _history_db():
+    folder = os.path.dirname(os.path.abspath(HISTORY_DB_PATH))
+    os.makedirs(folder, exist_ok=True)
+    conn = sqlite3.connect(HISTORY_DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS omm_history_fetches (
+            catalog_id INTEGER PRIMARY KEY,
+            status TEXT NOT NULL,
+            attempted_at_utc TEXT NOT NULL,
+            completed_at_utc TEXT,
+            record_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS omm_history_records (
+            catalog_id INTEGER NOT NULL,
+            epoch_utc TEXT NOT NULL,
+            creation_date TEXT,
+            source TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY (catalog_id, epoch_utc)
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def _history_storage_info():
+    # Render's ordinary container filesystem is ephemeral. A persistent disk
+    # must be mounted and HISTORY_DB_PATH pointed inside that mount.
+    return {
+        "database_path": HISTORY_DB_PATH,
+        "persistence": "persistent_disk" if os.path.abspath(HISTORY_DB_PATH).startswith("/var/data/") else "ephemeral_filesystem",
+        "note": "Render filesystem is not durable across instance replacement/redeploy unless HISTORY_DB_PATH is on an attached persistent disk."
+    }
+
+
+@app.get("/api/v1/v6/omm/history/{catalog_id}")
+def get_omm_history(catalog_id: int, limit: int = 20):
+    """Fetch GP_HISTORY once per catalog ID, archive locally, then serve cached history."""
+    if not 1 <= catalog_id <= 999999:
+        raise HTTPException(status_code=422, detail="Catalog ID ต้องอยู่ในช่วง 1–999999")
+    if not 2 <= limit <= 50:
+        raise HTTPException(status_code=422, detail="limit ต้องอยู่ระหว่าง 2 ถึง 50")
+
+    with _HISTORY_FETCH_LOCK:
+        conn = _history_db()
+        try:
+            state = conn.execute(
+                "SELECT * FROM omm_history_fetches WHERE catalog_id=?", (catalog_id,)
+            ).fetchone()
+
+            if state is None:
+                attempted = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "INSERT INTO omm_history_fetches(catalog_id,status,attempted_at_utc) VALUES(?,?,?)",
+                    (catalog_id, "fetching", attempted)
+                )
+                conn.commit()
+                try:
+                    opener = _spacetrack_opener()
+                    url = (
+                        "https://www.space-track.org/basicspacedata/query/class/gp_history/"
+                        f"NORAD_CAT_ID/{catalog_id}/orderby/EPOCH%20desc/limit/{limit}/format/json"
+                    )
+                    request = urllib.request.Request(
+                        url, headers={"User-Agent": "Thai-Reentry-Predictor/6.1"}
+                    )
+                    with opener.open(request, timeout=30) as response:
+                        raw = response.read().decode("utf-8", errors="replace")
+                    payload = json.loads(raw)
+                    if not isinstance(payload, list) or not payload:
+                        raise ValueError("Space-Track GP_HISTORY returned no records")
+                    saved = []
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        fields = {str(k).upper(): v for k, v in item.items()}
+                        raw_id = fields.get("NORAD_CAT_ID", fields.get("NORAD_CATID"))
+                        if raw_id is None or int(raw_id) != catalog_id:
+                            continue
+                        epoch_raw = fields.get("EPOCH")
+                        if not epoch_raw:
+                            continue
+                        epoch = datetime.fromisoformat(str(epoch_raw).replace("Z", "+00:00"))
+                        if epoch.tzinfo is None:
+                            epoch = epoch.replace(tzinfo=timezone.utc)
+                        else:
+                            epoch = epoch.astimezone(timezone.utc)
+                        fields["NORAD_CAT_ID"] = str(catalog_id)
+                        saved.append((catalog_id, epoch.isoformat(), str(fields.get("CREATION_DATE") or ""),
+                                      "Space-Track GP_HISTORY", json.dumps(fields, separators=(",", ":"))))
+                    if len(saved) < 2:
+                        raise ValueError(f"GP_HISTORY returned only {len(saved)} valid records; at least 2 are required")
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO omm_history_records(catalog_id,epoch_utc,creation_date,source,payload_json) VALUES(?,?,?,?,?)",
+                        saved
+                    )
+                    conn.execute(
+                        "UPDATE omm_history_fetches SET status=?,completed_at_utc=?,record_count=?,error=NULL WHERE catalog_id=?",
+                        ("completed", datetime.now(timezone.utc).isoformat(), len(saved), catalog_id)
+                    )
+                    conn.commit()
+                except Exception as exc:
+                    # Do not silently repeat a GP_HISTORY request: Space-Track
+                    # explicitly limits this class to one retrieval per object lifetime.
+                    conn.execute(
+                        "UPDATE omm_history_fetches SET status=?,completed_at_utc=?,error=? WHERE catalog_id=?",
+                        ("failed_no_auto_retry", datetime.now(timezone.utc).isoformat(), str(exc)[:500], catalog_id)
+                    )
+                    conn.commit()
+                    raise HTTPException(status_code=503, detail={
+                        "message": "Historical OMM retrieval failed; automatic retry is disabled to respect Space-Track GP_HISTORY usage policy.",
+                        "error": str(exc)[:300],
+                        "storage": _history_storage_info()
+                    }) from exc
+            elif state["status"] != "completed":
+                raise HTTPException(status_code=503, detail={
+                    "message": "A GP_HISTORY retrieval was already attempted for this catalog ID and was not completed. No automatic retry will be made.",
+                    "fetch_status": state["status"], "error": state["error"],
+                    "attempted_at_utc": state["attempted_at_utc"],
+                    "storage": _history_storage_info()
+                })
+
+            rows = conn.execute(
+                "SELECT * FROM omm_history_records WHERE catalog_id=? ORDER BY epoch_utc DESC LIMIT ?",
+                (catalog_id, limit)
+            ).fetchall()
+            records = [json.loads(row["payload_json"]) for row in reversed(rows)]
+            first = conn.execute(
+                "SELECT * FROM omm_history_fetches WHERE catalog_id=?", (catalog_id,)
+            ).fetchone()
+            return {
+                "api_version": APP_VERSION,
+                "catalog_id": catalog_id,
+                "source": "Space-Track GP_HISTORY",
+                "fetch_status": first["status"],
+                "snapshot_count": len(records),
+                "records_chronological": records,
+                "fetched_at_utc": first["completed_at_utc"],
+                "storage": _history_storage_info(),
+                "usage_policy": "GP_HISTORY is queried at most once per catalog ID by this service; subsequent responses are served from the local archive.",
+                "limitations": [
+                    "GP_HISTORY records are historical catalog element sets, not independent truth ephemerides.",
+                    "A persistent Render disk is required to preserve the archive across instance replacement or redeploy.",
+                    "Historical element sets may have been generated from correlated tracking data and are not independent sensor observations."
+                ]
+            }
+        finally:
+            conn.close()
+
+
 # OMM catalog feed: accepts five- and six-digit catalog IDs and preserves full OMM fields.
 _OMM_SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
 

@@ -1053,7 +1053,7 @@ def validate_long_term(req: LongTermValidationRequest):
             raise HTTPException(status_code=422, detail="OMM NORAD_CAT_ID is outside 1–999999")
         epoch = as_utc(datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00")))
         fields["EPOCH"] = epoch.replace(tzinfo=None).strftime("%Y-%m-%dT%H:%M:%S.%f")
-        fields.setdefault("OBJECT_ID", "0000-00A")
+        fields.setdefault("OBJECT_ID", "0000-000A")
         fields.setdefault("CLASSIFICATION_TYPE", "U")
         fields.setdefault("EPHEMERIS_TYPE", 0)
         fields.setdefault("ELEMENT_SET_NO", 0)

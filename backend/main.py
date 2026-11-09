@@ -469,7 +469,7 @@ def get_latest_tle(norad_id: int):
             line2 = payload.get("line2")
             if not line1 or not line2:
                 raise ValueError("Fallback API response did not contain line1 and line2")
-            raw = "\\n".join([
+            raw = "\n".join([
                 str(payload.get("name") or f"NORAD {norad_id}"),
                 line1,
                 line2,

@@ -890,6 +890,23 @@ def atmosphere(req: AtmosphereRequest):
         raise HTTPException(status_code=503, detail=f"MSISE-00 calculation failed: {exc}") from exc
 
 
+@app.get("/api/v1/validate/sgp4/{catalog_id}")
+def validate_latest_catalog_sgp4(catalog_id: int):
+    """Fetch the latest validated OMM record and run the SGP4 consistency test in one request."""
+    record = get_latest_omm(catalog_id)
+    request = SGP4ValidationRequest(
+        omm_fields=record["omm_fields"],
+        tle_line1=(record.get("tle_export") or {}).get("line1"),
+        tle_line2=(record.get("tle_export") or {}).get("line2"),
+    )
+    result = validate_sgp4(request)
+    result["source"] = record.get("source")
+    result["source_url"] = record.get("source_url")
+    result["fetched_at_utc"] = record.get("fetched_at_utc")
+    result["cache"] = record.get("cache")
+    return result
+
+
 @app.post("/api/v1/validate/sgp4")
 def validate_sgp4(req: SGP4ValidationRequest):
     """Validate OMM SGP4 initialization and propagate at fixed offsets; optionally compare its TLE export."""

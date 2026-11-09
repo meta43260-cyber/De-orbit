@@ -92,6 +92,11 @@ class LongTermValidationRequest(BaseModel):
     offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0], min_length=1, max_length=12)
 
 
+class LatestEpochComparisonRequest(BaseModel):
+    older_omm_fields: dict
+    offsets_hours: list[float] = Field(default=[0.0, 6.0, 12.0, 24.0, 48.0, 72.0, 168.0], min_length=1, max_length=12)
+
+
 class EpochComparisonValidationRequest(BaseModel):
     older_omm_fields: dict
     newer_omm_fields: dict
@@ -1119,7 +1124,7 @@ def validate_long_term(req: LongTermValidationRequest):
 
 @app.post("/api/v1/validate/epoch-comparison")
 def validate_epoch_comparison(req: EpochComparisonValidationRequest):
-    """Compare two independently time-tagged GP/OMM solutions at common future times.
+    """Compare two differently time-tagged GP/OMM solutions at common future times.
 
     This measures disagreement between catalog solutions, not error against truth.
     """
@@ -1255,6 +1260,30 @@ def validate_epoch_comparison(req: EpochComparisonValidationRequest):
             "ผลนี้ไม่ใช่การรับรองความแม่นยำของการทำนาย re-entry",
         ],
     }
+
+
+@app.post("/api/v1/validate/epoch-comparison/latest/{catalog_id}")
+def validate_epoch_comparison_with_latest(catalog_id: int, req: LatestEpochComparisonRequest):
+    """Compare a saved older OMM snapshot against the latest validated catalog OMM."""
+    if not 1 <= catalog_id <= 999999:
+        raise HTTPException(status_code=422, detail="Catalog ID ต้องอยู่ในช่วง 1–999999")
+    try:
+        older_id = int(req.older_omm_fields.get("NORAD_CAT_ID", req.older_omm_fields.get("norad_cat_id", 0)))
+    except Exception:
+        older_id = 0
+    if older_id != catalog_id:
+        raise HTTPException(status_code=422, detail="NORAD_CAT_ID ใน older_omm_fields ต้องตรงกับ catalog_id ใน URL")
+    latest_record = get_latest_omm(catalog_id)
+    result = validate_epoch_comparison(EpochComparisonValidationRequest(
+        older_omm_fields=req.older_omm_fields,
+        newer_omm_fields=latest_record["omm_fields"],
+        offsets_hours=req.offsets_hours,
+    ))
+    result["newer_source"] = latest_record.get("source")
+    result["newer_source_url"] = latest_record.get("source_url")
+    result["newer_fetched_at_utc"] = latest_record.get("fetched_at_utc")
+    result["newer_cache"] = latest_record.get("cache")
+    return result
 
 
 @app.post("/api/v1/validate/batch")

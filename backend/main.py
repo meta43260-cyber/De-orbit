@@ -426,103 +426,167 @@ def health():
     return {"status": "ok", "version": APP_VERSION, "atmosphere_model": "NRLMSISE-00"}
 
 
-@app.get("/api/v1/tle/{norad_id}")
-def get_latest_tle(norad_id: int):
-    """Fetch and validate the latest public GP TLE from CelesTrak by NORAD catalog ID."""
-    if not 1 <= norad_id <= 999999:
-        raise HTTPException(status_code=422, detail="NORAD Catalog ID ต้องอยู่ระหว่าง 1–999999")
+# In-memory cache: CelesTrak asks clients not to poll GP data more often than every 2 hours.
+_TLE_SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
+_TLE_CACHE_TTL_SECONDS = 7200
 
-    urls = [
-        f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle",
-        f"https://www.celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle",
-    ]
-    headers = {"User-Agent": "Thai-Reentry-Predictor/5.0 (educational research tool)"}
-    raw = None
-    source = "CelesTrak GP"
-    source_url = None
-    last_error = None
 
-    # Try the primary source first, with a short timeout per hostname.
-    for url in urls:
-        try:
-            request = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(request, timeout=6) as response:
-                raw = response.read().decode("utf-8", errors="replace")
-            source_url = url
-            break
-        except urllib.error.HTTPError as exc:
-            last_error = f"HTTP {exc.code} from {url}"
-        except Exception as exc:
-            last_error = str(exc)
+def _tle_epoch(line1: str) -> datetime:
+    if len(line1) < 32:
+        raise ValueError("TLE line 1 is too short to contain an Epoch")
+    field = line1[18:32]
+    yy = int(field[:2])
+    year = 1900 + yy if yy >= 57 else 2000 + yy
+    day_of_year = float(field[2:])
+    if not 1.0 <= day_of_year < 367.0:
+        raise ValueError("TLE Epoch day is outside its valid range")
+    return datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=day_of_year - 1)
 
-    # Fallback: community TLE API mirror (its catalog is updated daily from CelesTrak).
-    # Keep source and element epoch visible to clients; never present this as a direct CelesTrak fetch.
-    if raw is None:
-        fallback_url = f"https://tle.ivanstanojevic.me/api/tle/{norad_id}"
-        try:
-            request = urllib.request.Request(fallback_url, headers=headers)
-            with urllib.request.urlopen(request, timeout=8) as response:
-                payload = json.loads(response.read().decode("utf-8", errors="replace"))
-            if int(payload.get("satelliteId", payload.get("satellite_id", norad_id))) != norad_id:
-                raise ValueError("Fallback API returned a different NORAD ID")
-            line1 = payload.get("line1")
-            line2 = payload.get("line2")
-            if not line1 or not line2:
-                raise ValueError("Fallback API response did not contain line1 and line2")
-            raw = "\n".join([
-                str(payload.get("name") or f"NORAD {norad_id}"),
-                line1,
-                line2,
-            ])
-            source = "TLE API mirror (daily CelesTrak-derived data)"
-            source_url = fallback_url
-        except Exception as exc:
-            raise HTTPException(
-                status_code=503,
-                detail=f"ดึง TLE ไม่สำเร็จจาก CelesTrak และแหล่งสำรอง: {last_error}; fallback: {exc}",
-            ) from exc
 
+def _parse_tle_text(raw: str, norad_id: int) -> tuple[str, str, str]:
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    name, line1, line2 = None, None, None
     for i, line in enumerate(lines):
         if line.startswith("1 ") and i + 1 < len(lines) and lines[i + 1].startswith("2 "):
-            candidate1, candidate2 = line, lines[i + 1]
-            try:
-                catalog1 = int(candidate1[2:7])
-                catalog2 = int(candidate2[2:7])
-            except (ValueError, IndexError):
+            l1, l2 = line, lines[i + 1]
+            if len(l1) < 69 or len(l2) < 69:
                 continue
-            if catalog1 == norad_id and catalog2 == norad_id:
+            try:
+                id1, id2 = int(l1[2:7]), int(l2[2:7])
+            except ValueError:
+                continue
+            if id1 == norad_id and id2 == norad_id:
+                if not tle_checksum_ok(l1) or not tle_checksum_ok(l2):
+                    raise ValueError("TLE checksum mismatch")
                 name = lines[i - 1] if i > 0 and not lines[i - 1].startswith(("1 ", "2 ")) else f"NORAD {norad_id}"
-                line1, line2 = candidate1, candidate2
-                break
+                _tle_epoch(l1)
+                return name, l1, l2
+    raise ValueError(f"No valid 2-line element set for NORAD {norad_id}")
 
-    if not line1 or not line2:
-        raise HTTPException(status_code=404, detail=f"ไม่พบ GP TLE สำหรับ NORAD {norad_id}")
 
-    if not tle_checksum_ok(line1) or not tle_checksum_ok(line2):
-        raise HTTPException(status_code=502, detail=f"{source} ส่ง TLE ที่ checksum ไม่ถูกต้อง")
-
-    epoch_field = line1[18:32]
-    try:
-        yy = int(epoch_field[:2])
-        year = 1900 + yy if yy >= 57 else 2000 + yy
-        day_of_year = float(epoch_field[2:])
-        epoch = datetime(year, 1, 1, tzinfo=timezone.utc) + timedelta(days=day_of_year - 1)
-    except (ValueError, TypeError) as exc:
-        raise HTTPException(status_code=502, detail="ไม่สามารถอ่าน TLE Epoch ได้") from exc
-
+def _fetch_tle_candidate(url: str, source: str, norad_id: int, headers: dict) -> dict:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=6) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    name, line1, line2 = _parse_tle_text(raw, norad_id)
+    epoch = _tle_epoch(line1)
     return {
-        "norad_id": norad_id,
-        "name": name,
-        "line1": line1,
-        "line2": line2,
-        "epoch_utc": epoch.isoformat(),
-        "source": source,
-        "source_url": source_url,
-        "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+        "norad_id": norad_id, "name": name, "line1": line1, "line2": line2,
+        "epoch_utc": epoch.isoformat(), "epoch_timestamp": epoch.timestamp(),
+        "source": source, "source_url": url, "validation": "passed",
     }
 
+
+@app.get("/api/v1/tle/{norad_id}")
+def get_latest_tle(norad_id: int):
+    """Compare available public GP/SupGP TLE feeds and select the newest valid Epoch."""
+    if not 1 <= norad_id <= 99999:
+        raise HTTPException(
+            status_code=422,
+            detail="TLE แบบ 2-line รองรับ NORAD ID 1–99999 เท่านั้น; วัตถุที่มี Catalog ID 6 หลักต้องใช้ OMM/JSON",
+        )
+
+    now = time.time()
+    cached = _TLE_SOURCE_CACHE.get(norad_id)
+    if cached and now - cached[0] < _TLE_CACHE_TTL_SECONDS:
+        result = dict(cached[1])
+        result["cache"] = {"hit": True, "age_seconds": round(now - cached[0]), "ttl_seconds": _TLE_CACHE_TTL_SECONDS}
+        return result
+
+    headers = {"User-Agent": "Thai-Reentry-Predictor/5.1 (educational research tool)"}
+    source_specs = [
+        ("CelesTrak GP", f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle",
+         "CelesTrak data service; primary GP feed"),
+        ("CelesTrak SupGP", f"https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?CATNR={norad_id}&FORMAT=tle",
+         "CelesTrak supplemental feed; not an independent tracking network"),
+    ]
+    candidates = []
+    source_status = []
+
+    for source, url, relationship in source_specs:
+        started = time.monotonic()
+        try:
+            candidate = _fetch_tle_candidate(url, source, norad_id, headers)
+            candidate["relationship"] = relationship
+            candidate["latency_ms"] = round((time.monotonic() - started) * 1000)
+            candidates.append(candidate)
+            source_status.append({
+                "source": source, "status": "ok", "epoch_utc": candidate["epoch_utc"],
+                "latency_ms": candidate["latency_ms"], "relationship": relationship,
+            })
+        except urllib.error.HTTPError as exc:
+            source_status.append({"source": source, "status": "error", "error": f"HTTP {exc.code}",
+                                  "latency_ms": round((time.monotonic() - started) * 1000),
+                                  "relationship": relationship})
+        except Exception as exc:
+            source_status.append({"source": source, "status": "error", "error": str(exc)[:240],
+                                  "latency_ms": round((time.monotonic() - started) * 1000),
+                                  "relationship": relationship})
+
+    mirror_url = f"https://tle.ivanstanojevic.me/api/tle/{norad_id}"
+    started = time.monotonic()
+    mirror_relationship = "Community mirror; documented as CelesTrak-derived, not an independent tracking network"
+    try:
+        request = urllib.request.Request(mirror_url, headers=headers)
+        with urllib.request.urlopen(request, timeout=6) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+        returned_id = int(payload.get("satelliteId", payload.get("satellite_id", norad_id)))
+        if returned_id != norad_id:
+            raise ValueError(f"Mirror returned NORAD ID {returned_id}, expected {norad_id}")
+        name = str(payload.get("name") or f"NORAD {norad_id}")
+        line1, line2 = str(payload.get("line1") or "").strip(), str(payload.get("line2") or "").strip()
+        if not tle_checksum_ok(line1) or not tle_checksum_ok(line2):
+            raise ValueError("Mirror TLE checksum mismatch")
+        if int(line1[2:7]) != norad_id or int(line2[2:7]) != norad_id:
+            raise ValueError("Mirror TLE catalog number mismatch")
+        epoch = _tle_epoch(line1)
+        candidates.append({
+            "norad_id": norad_id, "name": name, "line1": line1, "line2": line2,
+            "epoch_utc": epoch.isoformat(), "epoch_timestamp": epoch.timestamp(),
+            "source": "TLE API mirror", "source_url": mirror_url, "validation": "passed",
+            "relationship": mirror_relationship,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+        })
+        source_status.append({"source": "TLE API mirror", "status": "ok", "epoch_utc": epoch.isoformat(),
+                              "latency_ms": round((time.monotonic() - started) * 1000),
+                              "relationship": mirror_relationship})
+    except urllib.error.HTTPError as exc:
+        source_status.append({"source": "TLE API mirror", "status": "error", "error": f"HTTP {exc.code}",
+                              "latency_ms": round((time.monotonic() - started) * 1000),
+                              "relationship": mirror_relationship})
+    except Exception as exc:
+        source_status.append({"source": "TLE API mirror", "status": "error", "error": str(exc)[:240],
+                              "latency_ms": round((time.monotonic() - started) * 1000),
+                              "relationship": mirror_relationship})
+
+    if not candidates:
+        raise HTTPException(status_code=503, detail={
+            "message": f"ไม่พบ TLE ที่ผ่านการตรวจสอบสำหรับ NORAD {norad_id}",
+            "sources_checked": source_status,
+        })
+
+    candidates.sort(key=lambda item: item["epoch_timestamp"], reverse=True)
+    selected = candidates[0]
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    age_hours = (datetime.now(timezone.utc) - _tle_epoch(selected["line1"])).total_seconds() / 3600.0
+    result = {
+        "norad_id": norad_id, "name": selected["name"],
+        "line1": selected["line1"], "line2": selected["line2"],
+        "epoch_utc": selected["epoch_utc"], "source": selected["source"],
+        "source_url": selected["source_url"], "fetched_at_utc": fetched_at,
+        "selected_source": selected["source"],
+        "selection_method": "newest_valid_epoch",
+        "epoch_age_hours": round(age_hours, 2),
+        "freshness": "stale_over_72h" if age_hours > 72 else "stale_over_24h" if age_hours > 24 else "under_24h",
+        "candidates": [
+            {k: v for k, v in item.items() if k != "epoch_timestamp"}
+            for item in candidates
+        ],
+        "sources_checked": source_status,
+        "source_independence_note": "These feeds are not three independent tracking networks. CelesTrak GP and SupGP are CelesTrak products; the community mirror is CelesTrak-derived.",
+        "cache": {"hit": False, "ttl_seconds": _TLE_CACHE_TTL_SECONDS},
+    }
+    _TLE_SOURCE_CACHE[norad_id] = (now, result)
+    return result
 
 @app.post("/api/v1/atmosphere")
 def atmosphere(req: AtmosphereRequest):

@@ -121,6 +121,14 @@ def make_satrec_from_request(req: SimulationRequest) -> Satrec:
             missing = [key for key in required if fields.get(key) in (None, "")]
             if missing:
                 raise ValueError("OMM fields missing: " + ", ".join(missing))
+            fields.setdefault("OBJECT_ID", "0000-000A")
+            fields.setdefault("CLASSIFICATION_TYPE", "U")
+            fields.setdefault("EPHEMERIS_TYPE", 0)
+            fields.setdefault("ELEMENT_SET_NO", 0)
+            fields.setdefault("REV_AT_EPOCH", 0)
+            fields.setdefault("BSTAR", 0.0)
+            fields.setdefault("MEAN_MOTION_DOT", 0.0)
+            fields.setdefault("MEAN_MOTION_DDOT", 0.0)
             sat = Satrec()
             initialize_omm(sat, fields)
             if sat.error:
@@ -643,6 +651,14 @@ def _parse_omm_payload(raw: str, catalog_id: int) -> dict:
             raise ValueError("OMM orbital elements are outside accepted ranges")
         fields["NORAD_CAT_ID"] = str(catalog_id)
         fields["EPOCH"] = epoch.isoformat().replace("+00:00", "Z")
+        fields.setdefault("OBJECT_ID", "0000-000A")
+        fields.setdefault("CLASSIFICATION_TYPE", "U")
+        fields.setdefault("EPHEMERIS_TYPE", 0)
+        fields.setdefault("ELEMENT_SET_NO", 0)
+        fields.setdefault("REV_AT_EPOCH", 0)
+        fields.setdefault("BSTAR", 0.0)
+        fields.setdefault("MEAN_MOTION_DOT", 0.0)
+        fields.setdefault("MEAN_MOTION_DDOT", 0.0)
         sat = Satrec()
         initialize_omm(sat, fields)
         if sat.error:

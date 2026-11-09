@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import http.cookiejar
 import hashlib
+import hmac
 import urllib.parse
 import threading
 import time
@@ -21,14 +22,14 @@ from typing import Optional
 
 import numpy as np
 import pymsis
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "6.2.0-historical-archive-backup"
+APP_VERSION = "6.3.0-backup-integrity-recovery"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -39,9 +40,9 @@ ENTRY_ALT_DEFAULT_KM = 120.0
 MSIS_VERSION = 0             # NRLMSISE-00 (not MSIS 2.x)
 
 app = FastAPI(
-    title="Thai Re-entry Predictor API v6.2",
+    title="Thai Re-entry Predictor API v6.3",
     version=APP_VERSION,
-    description="Advanced phone-cloud orbital decay, archived historical OMM and scenario-based re-entry analysis API; research prototype, not an operational forecast.",
+    description="Advanced phone-cloud orbital decay, verified OMM archive backup and controlled recovery API; research prototype, not an operational forecast.",
 )
 
 origins = os.getenv("ALLOWED_ORIGINS", "*")
@@ -953,6 +954,205 @@ def get_omm_history(catalog_id: int, limit: int = 20):
             except Exception:
                 pass
         conn.close()
+
+
+def _archive_canonical_digest(fetch_states: list, records: list) -> str:
+    canonical = json.dumps(
+        {"fetch_states": fetch_states, "records": records},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_archive_document(document: dict) -> tuple[list, list]:
+    if not isinstance(document, dict):
+        raise HTTPException(status_code=422, detail="Backup body must be a JSON object")
+    if document.get("backup_format") != "thai-reentry-predictor-omm-archive":
+        raise HTTPException(status_code=422, detail="Unsupported backup_format")
+    if document.get("backup_schema_version") != 1:
+        raise HTTPException(status_code=422, detail="Unsupported backup_schema_version")
+    fetch_states = document.get("fetch_states")
+    records = document.get("records")
+    if not isinstance(fetch_states, list) or not isinstance(records, list):
+        raise HTTPException(status_code=422, detail="fetch_states and records must be arrays")
+    if document.get("fetch_state_count") != len(fetch_states):
+        raise HTTPException(status_code=422, detail="fetch_state_count does not match fetch_states")
+    if document.get("record_count") != len(records):
+        raise HTTPException(status_code=422, detail="record_count does not match records")
+
+    supplied_hash = document.get("sha256")
+    if not isinstance(supplied_hash, str) or len(supplied_hash) != 64:
+        raise HTTPException(status_code=422, detail="sha256 must be a 64-character hex digest")
+    try:
+        int(supplied_hash, 16)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="sha256 is not valid hexadecimal") from exc
+    actual_hash = _archive_canonical_digest(fetch_states, records)
+    if not hmac.compare_digest(supplied_hash.lower(), actual_hash):
+        raise HTTPException(status_code=422, detail={
+            "message": "Backup SHA-256 verification failed",
+            "expected_sha256": supplied_hash.lower(),
+            "actual_sha256": actual_hash
+        })
+
+    seen_states = set()
+    for index, state in enumerate(fetch_states):
+        if not isinstance(state, dict):
+            raise HTTPException(status_code=422, detail=f"fetch_states[{index}] must be an object")
+        try:
+            cid = int(state["catalog_id"])
+            status = str(state["status"])
+            attempted = str(state["attempted_at_utc"])
+            count = int(state.get("record_count", 0))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid fetch_states[{index}]") from exc
+        if not 1 <= cid <= 999999 or cid in seen_states:
+            raise HTTPException(status_code=422, detail=f"Invalid or duplicate catalog_id in fetch_states[{index}]")
+        if status not in ("completed", "failed_no_auto_retry"):
+            raise HTTPException(status_code=422, detail=f"Unsafe fetch status in fetch_states[{index}]")
+        if count < 0 or not attempted:
+            raise HTTPException(status_code=422, detail=f"Invalid count or attempted timestamp in fetch_states[{index}]")
+        seen_states.add(cid)
+        completed = state.get("completed_at_utc")
+        error = state.get("error")
+        if completed is not None and not isinstance(completed, str):
+            raise HTTPException(status_code=422, detail=f"Invalid completed_at_utc in fetch_states[{index}]")
+        if error is not None and not isinstance(error, str):
+            raise HTTPException(status_code=422, detail=f"Invalid error in fetch_states[{index}]")
+
+    seen_records = set()
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise HTTPException(status_code=422, detail=f"records[{index}] must be an object")
+        try:
+            cid = int(record["catalog_id"])
+            epoch = str(record["epoch_utc"])
+            source = str(record["source"])
+            payload = record["payload"]
+            datetime.fromisoformat(epoch.replace("Z", "+00:00"))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid records[{index}]") from exc
+        if not 1 <= cid <= 999999 or not source or not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail=f"Invalid catalog_id, source or payload in records[{index}]")
+        if (cid, epoch) in seen_records:
+            raise HTTPException(status_code=422, detail=f"Duplicate catalog_id/epoch in records[{index}]")
+        seen_records.add((cid, epoch))
+        try:
+            payload_id = int(payload.get("NORAD_CAT_ID", payload.get("NORAD_CATID", 0)))
+        except (TypeError, ValueError):
+            payload_id = 0
+        if payload_id != cid:
+            raise HTTPException(status_code=422, detail=f"Payload catalog ID mismatch in records[{index}]")
+        creation_date = record.get("creation_date")
+        if creation_date is not None and not isinstance(creation_date, str):
+            raise HTTPException(status_code=422, detail=f"Invalid creation_date in records[{index}]")
+    return fetch_states, records
+
+
+@app.post("/api/v1/v6/backup/verify")
+def v6_backup_verify(document: dict):
+    """Verify archive structure and SHA-256 without changing the database."""
+    fetch_states, records = _validate_archive_document(document)
+    return {
+        "api_version": APP_VERSION,
+        "status": "verified",
+        "backup_schema_version": 1,
+        "fetch_state_count": len(fetch_states),
+        "record_count": len(records),
+        "sha256": _archive_canonical_digest(fetch_states, records),
+        "database_modified": False,
+        "gp_history_requested": False
+    }
+
+
+@app.post("/api/v1/v6/backup/restore")
+def v6_backup_restore(
+    document: dict,
+    x_archive_restore_token: Optional[str] = Header(default=None, alias="X-Archive-Restore-Token")
+):
+    """Restore a verified backup only into an empty archive; requires a private server-side token."""
+    configured_token = os.getenv("ARCHIVE_RESTORE_TOKEN")
+    if not configured_token or len(configured_token) < 32:
+        raise HTTPException(status_code=503, detail={
+            "status": "restore_not_configured",
+            "required_setup": "Set ARCHIVE_RESTORE_TOKEN to a random secret of at least 32 characters in Render environment variables."
+        })
+    if not x_archive_restore_token or not hmac.compare_digest(x_archive_restore_token, configured_token):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Archive-Restore-Token")
+
+    fetch_states, records = _validate_archive_document(document)
+    catalog_ids = sorted({int(x["catalog_id"]) for x in fetch_states} |
+                         {int(x["catalog_id"]) for x in records})
+    if not catalog_ids:
+        raise HTTPException(status_code=422, detail="Empty backup: nothing to restore")
+
+    try:
+        conn = _history_db()
+        try:
+            with conn.transaction():
+                # Lock all affected catalog IDs in stable order to avoid concurrent restore/fetch races.
+                for cid in catalog_ids:
+                    conn.execute("SELECT pg_advisory_xact_lock(%s)", (cid,))
+                existing = conn.execute("""
+                    SELECT
+                      (SELECT COUNT(*) FROM omm_history_fetches) AS fetch_count,
+                      (SELECT COUNT(*) FROM omm_history_records) AS record_count
+                """).fetchone()
+                if int(existing["fetch_count"]) or int(existing["record_count"]):
+                    raise HTTPException(status_code=409, detail={
+                        "status": "restore_requires_empty_archive",
+                        "existing_fetch_states": int(existing["fetch_count"]),
+                        "existing_records": int(existing["record_count"]),
+                        "note": "No database rows were changed. Export the current archive before considering a controlled merge."
+                    })
+
+                for state in fetch_states:
+                    conn.execute("""
+                        INSERT INTO omm_history_fetches
+                        (catalog_id,status,attempted_at_utc,completed_at_utc,record_count,error)
+                        VALUES(%s,%s,%s,%s,%s,%s)
+                    """, (
+                        int(state["catalog_id"]), state["status"], state["attempted_at_utc"],
+                        state.get("completed_at_utc"), int(state.get("record_count", 0)),
+                        state.get("error")
+                    ))
+
+                for record in records:
+                    epoch_raw = str(record["epoch_utc"])
+                    epoch_dt = datetime.fromisoformat(epoch_raw.replace("Z", "+00:00"))
+                    if epoch_dt.tzinfo is None:
+                        epoch_dt = epoch_dt.replace(tzinfo=timezone.utc)
+                    epoch_utc = epoch_dt.astimezone(timezone.utc).isoformat()
+                    conn.execute("""
+                        INSERT INTO omm_history_records
+                        (catalog_id,epoch_utc,creation_date,source,payload_json)
+                        VALUES(%s,%s,%s,%s,%s)
+                    """, (
+                        int(record["catalog_id"]), epoch_utc, record.get("creation_date"),
+                        str(record["source"]),
+                        json.dumps(record["payload"], separators=(",", ":"), ensure_ascii=False)
+                    ))
+        finally:
+            conn.close()
+        return {
+            "api_version": APP_VERSION,
+            "status": "restored",
+            "restored_fetch_state_count": len(fetch_states),
+            "restored_record_count": len(records),
+            "catalog_count": len(catalog_ids),
+            "sha256": _archive_canonical_digest(fetch_states, records),
+            "database_modified": True,
+            "gp_history_requested": False,
+            "note": "Restore completed transactionally into an empty archive. No Space-Track request was made."
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail={
+            "status": "restore_failed",
+            "error": str(exc)[:200],
+            "gp_history_requested": False
+        }) from exc
 
 
 @app.get("/api/v1/v6/backup/status")

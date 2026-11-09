@@ -704,7 +704,10 @@ def _parse_omm_payload(raw: str, catalog_id: int) -> dict:
                 and 0 <= numeric["INCLINATION"] <= 180):
             raise ValueError("OMM orbital elements are outside accepted ranges")
         fields["NORAD_CAT_ID"] = str(catalog_id)
-        fields["EPOCH"] = epoch.isoformat().replace("+00:00", "Z")
+        # sgp4.omm.initialize expects a strict ISO timestamp without a trailing
+        # UTC "Z" or timezone suffix. The parsed datetime is already normalized
+        # to UTC, so serialize it as a naive UTC timestamp with microseconds.
+        fields["EPOCH"] = epoch.strftime("%Y-%m-%dT%H:%M:%S.%f")
         fields.setdefault("OBJECT_ID", "0000-000A")
         fields.setdefault("CLASSIFICATION_TYPE", "U")
         fields.setdefault("EPHEMERIS_TYPE", 0)

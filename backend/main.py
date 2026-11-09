@@ -27,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "6.0.0-advanced-reentry-foundation"
+APP_VERSION = "6.1.0-historical-omm-archive"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -38,9 +38,9 @@ ENTRY_ALT_DEFAULT_KM = 120.0
 MSIS_VERSION = 0             # NRLMSISE-00 (not MSIS 2.x)
 
 app = FastAPI(
-    title="Thai Re-entry Predictor API",
+    title="Thai Re-entry Predictor API v6.1",
     version=APP_VERSION,
-    description="Advanced phone-cloud orbital decay and scenario-based re-entry analysis API; research prototype, not an operational forecast.",
+    description="Advanced phone-cloud orbital decay, archived historical OMM and scenario-based re-entry analysis API; research prototype, not an operational forecast.",
 )
 
 origins = os.getenv("ALLOWED_ORIGINS", "*")

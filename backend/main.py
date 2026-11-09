@@ -303,7 +303,8 @@ def state_diagnostics(when: datetime, y: np.ndarray, req):
     rho, temp = msis_density(when, lat, lon, alt_km, req)
     v_atm = np.cross(np.array([0.0, 0.0, EARTH_OMEGA]), r)
     v_rel = v - v_atm
-    speed_rel = float(np.linalg.norm(v_rel))    drag_acc = -0.5 * rho * req.drag_coefficient * req.reference_area_m2 / req.mass_kg * speed_rel * v_rel
+    speed_rel = float(np.linalg.norm(v_rel))
+    drag_acc = -0.5 * rho * req.drag_coefficient * req.reference_area_m2 / req.mass_kg * speed_rel * v_rel
     decel = float(np.linalg.norm(drag_acc))
     q_dyn = 0.5 * rho * speed_rel * speed_rel
     heat_flux = 1.83e-4 * math.sqrt(max(rho, 0.0) / req.nose_radius_m) * speed_rel ** 3

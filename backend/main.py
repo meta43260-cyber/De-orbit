@@ -24,7 +24,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.2.0-unified-tle-omm-alpha"
+APP_VERSION = "5.3.0-parallel-omm-fetch"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3

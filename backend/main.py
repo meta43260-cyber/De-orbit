@@ -10,6 +10,9 @@ import json
 import os
 import urllib.error
 import urllib.request
+import http.cookiejar
+import urllib.parse
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -24,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.3.0-parallel-omm-fetch"
+APP_VERSION = "5.4.0-spacetrack-primary"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -456,7 +459,10 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": APP_VERSION, "atmosphere_model": "NRLMSISE-00"}
+    return {
+        "status": "ok", "version": APP_VERSION, "atmosphere_model": "NRLMSISE-00",
+        "spacetrack_configured": bool(os.getenv("SPACETRACK_USER") and os.getenv("SPACETRACK_PASS")),
+    }
 
 
 # In-memory cache: CelesTrak asks clients not to poll GP data more often than every 2 hours.
@@ -626,6 +632,53 @@ def get_latest_tle(norad_id: int):
 # OMM catalog feed: accepts five- and six-digit catalog IDs and preserves full OMM fields.
 _OMM_SOURCE_CACHE: dict[int, tuple[float, dict]] = {}
 
+# Space-Track uses session-cookie authentication. Keep the authenticated opener in
+# process memory; credentials and cookies are never returned by API responses.
+_SPACETRACK_LOCK = threading.Lock()
+_SPACETRACK_SESSION = {"opener": None, "created_at": 0.0}
+_SPACETRACK_SESSION_TTL = 20 * 60
+
+
+def _spacetrack_opener():
+    username = os.getenv("SPACETRACK_USER")
+    password = os.getenv("SPACETRACK_PASS")
+    if not username or not password:
+        raise RuntimeError("credentials_not_configured")
+    with _SPACETRACK_LOCK:
+        now = time.time()
+        opener = _SPACETRACK_SESSION.get("opener")
+        if opener is not None and now - _SPACETRACK_SESSION["created_at"] < _SPACETRACK_SESSION_TTL:
+            return opener
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        login_data = urllib.parse.urlencode({"identity": username, "password": password}).encode("utf-8")
+        login_req = urllib.request.Request(
+            "https://www.space-track.org/ajaxauth/login", data=login_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Thai-Reentry-Predictor/5.4"},
+            method="POST",
+        )
+        with opener.open(login_req, timeout=18) as response:
+            login_text = response.read(4096).decode("utf-8", errors="replace").lower()
+        if "login failed" in login_text or "invalid username" in login_text:
+            raise RuntimeError("authentication_failed")
+        _SPACETRACK_SESSION.update({"opener": opener, "created_at": now})
+        return opener
+
+
+def _fetch_spacetrack_omm(catalog_id: int) -> dict:
+    opener = _spacetrack_opener()
+    url = "https://www.space-track.org/basicspacedata/query/class/gp/NORAD_CAT_ID/" + str(catalog_id) + "/format/json"
+    request = urllib.request.Request(url, headers={"User-Agent": "Thai-Reentry-Predictor/5.4"})
+    with opener.open(request, timeout=18) as response:
+        raw = response.read().decode("utf-8", errors="replace")
+    item = _parse_omm_payload(raw, catalog_id)
+    item.update({
+        "source": "Space-Track GP", "source_url": url,
+        "relationship": "18th Space Defense Squadron / Space-Track GP; primary catalog feed, not an independent sensor network",
+        "latency_ms": None,
+    })
+    return item
+
 
 def _parse_omm_payload(raw: str, catalog_id: int) -> dict:
     payload = json.loads(raw)
@@ -684,7 +737,7 @@ def _parse_omm_payload(raw: str, catalog_id: int) -> dict:
 
 @app.get("/api/v1/omm/{catalog_id}")
 def get_latest_omm(catalog_id: int):
-    """Fetch CelesTrak GP/SupGP OMM JSON concurrently and select newest valid Epoch."""
+    """Prefer Space-Track GP, compare CelesTrak GP/SupGP, and select newest valid Epoch."""
     if not 1 <= catalog_id <= 999999:
         raise HTTPException(status_code=422, detail="Catalog ID ต้องอยู่ในช่วง 1–999999")
     now = time.time()
@@ -724,6 +777,26 @@ def get_latest_omm(catalog_id: int):
                           "relationship": relationship}
 
     candidates, statuses = [], []
+
+    # Space-Track is the preferred catalog source when credentials are configured.
+    started = time.monotonic()
+    try:
+        item = _fetch_spacetrack_omm(catalog_id)
+        item["latency_ms"] = round((time.monotonic() - started) * 1000)
+        candidates.append(item)
+        statuses.append({"source": "Space-Track GP", "status": "ok", "epoch_utc": item["epoch_utc"],
+                         "latency_ms": item["latency_ms"], "relationship": item["relationship"]})
+    except urllib.error.HTTPError as exc:
+        statuses.append({"source": "Space-Track GP", "status": "error", "error": "HTTP " + str(exc.code),
+                         "latency_ms": round((time.monotonic() - started) * 1000), "relationship": "Space-Track GP"})
+        if exc.code in (401, 403):
+            _SPACETRACK_SESSION.update({"opener": None, "created_at": 0.0})
+    except Exception as exc:
+        reason = str(exc)
+        safe_reason = reason if reason in ("credentials_not_configured", "authentication_failed") else reason[:180]
+        statuses.append({"source": "Space-Track GP", "status": "error", "error": safe_reason,
+                         "latency_ms": round((time.monotonic() - started) * 1000), "relationship": "Space-Track GP"})
+
     executor = ThreadPoolExecutor(max_workers=2)
     futures = {executor.submit(fetch_one, spec): spec for spec in specs}
     try:
@@ -767,7 +840,7 @@ def get_latest_omm(catalog_id: int):
         "selected_source": selected["source"], "selection_method": "newest_valid_epoch",
         "candidates": [{k: v for k, v in item.items() if k != "epoch_timestamp"} for item in candidates],
         "sources_checked": statuses,
-        "source_independence_note": "GP and SupGP are both CelesTrak feeds, not independent tracking networks.",
+        "source_independence_note": "Space-Track GP is the primary catalog feed; CelesTrak GP/SupGP and the community mirror are redistributions/derivatives, not independent tracking networks.",
         "fetched_at_utc": datetime.now(timezone.utc).isoformat(),
         "cache": {"hit": False, "ttl_seconds": _TLE_CACHE_TTL_SECONDS},
     }

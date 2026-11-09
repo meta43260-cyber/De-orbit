@@ -27,7 +27,7 @@ from sgp4.api import Satrec, SGP4_ERRORS, jday, WGS72
 from sgp4.omm import initialize as initialize_omm
 from sgp4.exporter import export_tle
 
-APP_VERSION = "5.9.0-orbit-reliability-evidence"
+APP_VERSION = "6.0.0-advanced-reentry-foundation"
 MU = 3.986004418e14          # m^3/s^2
 RE = 6378137.0               # WGS-84 equatorial radius, m
 J2 = 1.08262668e-3
@@ -80,6 +80,34 @@ class SimulationRequest(BaseModel):
     f107_sfu: float = Field(default=150.0, ge=50, le=400)
     f107a_sfu: float = Field(default=150.0, ge=50, le=400)
     ap: float = Field(default=15.0, ge=0, le=400)
+
+
+class V6ReentryScenarioRequest(BaseModel):
+    object_type: str = Field(default="satellite", pattern="^(satellite|rocket_body)$")
+    material_label: str = Field(default="user_defined", min_length=1, max_length=80)
+    tle_line1: Optional[str] = None
+    tle_line2: Optional[str] = None
+    omm_fields: Optional[dict] = None
+    start_time_utc: datetime
+    entry_time_utc: Optional[datetime] = None
+    entry_altitude_km: float = Field(default=120.0, ge=80, le=150)
+    max_search_hours: float = Field(default=168.0, ge=1, le=720)
+    max_simulation_seconds: int = Field(default=1800, ge=60, le=3600)
+    sample_interval_s: float = Field(default=2.0, ge=0.5, le=30)
+    mass_kg: float = Field(gt=0, le=100000)
+    reference_area_m2: float = Field(gt=0, le=1000)
+    drag_coefficient: float = Field(default=2.2, ge=0.1, le=5.0)
+    nose_radius_m: float = Field(default=0.5, gt=0.001, le=20)
+    heat_of_ablation_j_kg: float = Field(default=8.0e6, ge=1.0e5, le=5.0e7)
+    ablation_efficiency: float = Field(default=0.5, ge=0.0, le=1.0)
+    heated_area_factor: float = Field(default=1.5, ge=0.1, le=10.0)
+    f107_sfu: float = Field(default=150.0, ge=50, le=400)
+    f107a_sfu: float = Field(default=150.0, ge=50, le=400)
+    ap: float = Field(default=15.0, ge=0, le=400)
+
+
+class OrbitalDecayTrendRequest(BaseModel):
+    omm_records: list[dict] = Field(min_length=2, max_length=24)
 
 
 class SGP4ValidationRequest(BaseModel):
@@ -1644,6 +1672,205 @@ def validate_atmosphere_sensitivity(req: AtmosphereSensitivityRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Atmosphere sensitivity calculation failed: {exc}") from exc
+
+
+
+
+@app.post("/api/v1/v6/orbit/decay-trend")
+def v6_orbital_decay_trend(req: OrbitalDecayTrendRequest):
+    """Descriptive trend of mean-motion-derived Keplerian semi-major-axis proxies."""
+    prepared = []
+    for index, raw in enumerate(req.omm_records):
+        fields = {str(k).upper(): v for k, v in raw.items()}
+        try:
+            catalog_id = int(fields["NORAD_CAT_ID"])
+            epoch = as_utc(datetime.fromisoformat(str(fields["EPOCH"]).replace("Z", "+00:00")))
+            mean_motion = float(fields["MEAN_MOTION"])
+            bstar = float(fields.get("BSTAR", 0.0) or 0.0)
+            if not math.isfinite(mean_motion) or not (0.0 < mean_motion < 20.0):
+                raise ValueError("MEAN_MOTION ต้องเป็น finite value ในช่วง 0–20 rev/day")
+            if not math.isfinite(bstar):
+                raise ValueError("BSTAR ต้องเป็น finite number")
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"OMM record {index + 1} ไม่ถูกต้อง: {exc}") from exc
+        n_rad_s = mean_motion * 2.0 * math.pi / 86400.0
+        a_m = (MU / (n_rad_s * n_rad_s)) ** (1.0 / 3.0)
+        prepared.append({
+            "catalog_id": catalog_id, "epoch": epoch,
+            "mean_motion_rev_day": mean_motion, "bstar": bstar,
+            "period_minutes": 1440.0 / mean_motion,
+            "keplerian_semimajor_axis_proxy_km": a_m / 1000.0,
+            "mean_motion_altitude_proxy_km": (a_m - 6371008.8) / 1000.0,
+        })
+    if len({x["catalog_id"] for x in prepared}) != 1:
+        raise HTTPException(status_code=422, detail="OMM ทุกชุดต้องเป็น NORAD_CAT_ID เดียวกัน")
+    if len({x["epoch"] for x in prepared}) != len(prepared):
+        raise HTTPException(status_code=422, detail="OMM EPOCH ต้องไม่ซ้ำกัน")
+    prepared.sort(key=lambda x: x["epoch"])
+    first, last = prepared[0], prepared[-1]
+    days = (last["epoch"] - first["epoch"]).total_seconds() / 86400.0
+    if days <= 0:
+        raise HTTPException(status_code=422, detail="ต้องมี Epoch ต่างกันอย่างน้อยสองเวลา")
+    delta_a = last["keplerian_semimajor_axis_proxy_km"] - first["keplerian_semimajor_axis_proxy_km"]
+    delta_n = last["mean_motion_rev_day"] - first["mean_motion_rev_day"]
+    trend = ("decaying_semimajor_axis_proxy" if delta_a < 0 and delta_n > 0 else
+             "increasing_semimajor_axis_proxy" if delta_a > 0 and delta_n < 0 else
+             "no_clear_monotonic_decay_signal")
+    return {
+        "api_version": APP_VERSION, "catalog_id": first["catalog_id"],
+        "analysis_type": "mean_motion_derived_orbital_decay_trend",
+        "snapshot_count": len(prepared), "epoch_span_days": days, "trend": trend,
+        "delta_mean_motion_rev_day": delta_n, "delta_semimajor_axis_proxy_km": delta_a,
+        "semimajor_axis_proxy_rate_km_day": delta_a / days,
+        "records_chronological": [{**x, "epoch_utc": x["epoch"].isoformat()} for x in prepared],
+        "interpretation": "ใช้ Kepler two-body relation แปลง Mean Motion เป็นกึ่งแกนเอกโดยประมาณ ไม่ใช่ความสูง geodetic หรือการ fit วงโคจรเต็มรูปแบบ",
+        "limitations": [
+            "Mean Motion ของ GP/SGP4 เป็น mean element; a ที่คำนวณได้เป็น proxy ไม่ใช่ osculating state",
+            "ไม่รวม covariance, maneuver detection, atmospheric density history หรือ independent tracking residuals",
+            "BSTAR เป็นพารามิเตอร์ fit ของ SGP4 ไม่ใช่ ballistic coefficient ทางกายภาพโดยตรง",
+            "snapshots จำนวนน้อยไม่เพียงพอสำหรับคำนวณวัน re-entry",
+        ],
+    }
+
+
+@app.post("/api/v1/v6/reentry/scenario")
+def v6_reentry_scenario(req: V6ReentryScenarioRequest):
+    """Scenario-only variable-mass entry model with a lumped effective ablation proxy."""
+    base = SimulationRequest(
+        tle_line1=req.tle_line1, tle_line2=req.tle_line2, omm_fields=req.omm_fields,
+        start_time_utc=req.start_time_utc, entry_time_utc=req.entry_time_utc,
+        entry_altitude_km=req.entry_altitude_km, max_search_hours=req.max_search_hours,
+        max_simulation_seconds=req.max_simulation_seconds, sample_interval_s=req.sample_interval_s,
+        mass_kg=req.mass_kg, reference_area_m2=req.reference_area_m2,
+        drag_coefficient=req.drag_coefficient, nose_radius_m=req.nose_radius_m,
+        f107_sfu=req.f107_sfu, f107a_sfu=req.f107a_sfu, ap=req.ap,
+    )
+    try:
+        sat = make_satrec_from_request(base)
+        entry_time, r0, v0, entry_geo, entry_source = find_entry_state(base, sat)
+        y, mass = np.concatenate((r0, v0)), float(req.mass_kg)
+        initial_mass, elapsed, current_time = mass, 0.0, entry_time
+        points, last_saved = [], -1e9
+        status, impact, steps = "time_limit", False, 0
+        max_steps = 30000
+
+        def mdot(diag):
+            power = (req.ablation_efficiency * diag["convective_heat_flux_W_m2"]
+                     * req.reference_area_m2 * req.heated_area_factor)
+            return -power / req.heat_of_ablation_j_kg
+
+        def save(diag, t, when, m):
+            points.append({
+                "elapsed_s": round(t, 3), "time_utc": when.isoformat(),
+                "mass_kg": round(max(0.0, m), 6),
+                "mass_remaining_fraction": round(max(0.0, m) / initial_mass, 8),
+                "mass_loss_kg": round(initial_mass - max(0.0, m), 6),
+                **{k: round(v, 8) if isinstance(v, float) else v
+                   for k, v in diag.items() if k != "drag_acceleration_m_s2"},
+            })
+
+        base.mass_kg = mass
+        _, last_diag = acceleration(current_time, y, base)
+        while elapsed < req.max_simulation_seconds and steps < max_steps:
+            dt = min(choose_step(last_diag["altitude_km"]), 1.0,
+                     req.max_simulation_seconds - elapsed)
+            base.mass_kg = max(mass, 1e-6)
+            k1, diag1 = acceleration(current_time, y, base)
+            rate1 = mdot(diag1)
+            base.mass_kg = max(1e-6, mass + 0.5 * dt * rate1)
+            y_mid = y + 0.5 * dt * k1
+            mid_time = current_time + timedelta(seconds=0.5 * dt)
+            k2, diag_mid = acceleration(mid_time, y_mid, base)
+            rate2 = mdot(diag_mid)
+            y_new, new_mass = y + dt * k2, mass + dt * rate2
+            next_time = current_time + timedelta(seconds=dt)
+            base.mass_kg = max(1e-6, new_mass)
+            _, next_diag = acceleration(next_time, y_new, base)
+
+            if next_diag["altitude_km"] <= 0.0:
+                h0, h1 = max(0.0, last_diag["altitude_km"]), next_diag["altitude_km"]
+                fraction = h0 / max(h0 - h1, 1e-12)
+                y = y + fraction * (y_new - y)
+                mass = max(0.0, mass + fraction * (new_mass - mass))
+                elapsed += fraction * dt
+                current_time += timedelta(seconds=fraction * dt)
+                base.mass_kg = max(mass, 1e-6)
+                _, last_diag = acceleration(current_time, y, base)
+                last_diag["altitude_km"] = 0.0
+                impact, status = True, "ground_intersection"
+                steps += 1
+                save(last_diag, elapsed, current_time, mass)
+                break
+            if new_mass <= 0.001:
+                fraction = max(0.0, min(1.0, (mass - 0.001) / max(mass - new_mass, 1e-12)))
+                y = y + fraction * (y_new - y)
+                elapsed += fraction * dt
+                current_time += timedelta(seconds=fraction * dt)
+                mass, status = 0.001, "mass_depleted_model_limit"
+                base.mass_kg = mass
+                _, last_diag = acceleration(current_time, y, base)
+                steps += 1
+                save(last_diag, elapsed, current_time, mass)
+                break
+
+            y, mass = y_new, new_mass
+            elapsed += dt
+            current_time = next_time
+            base.mass_kg = max(mass, 1e-6)
+            _, last_diag = acceleration(current_time, y, base)
+            steps += 1
+            if elapsed - last_saved >= req.sample_interval_s or steps == 1:
+                save(last_diag, elapsed, current_time, mass)
+                last_saved = elapsed
+
+        if steps >= max_steps:
+            status = "step_limit"
+        if not points:
+            save(last_diag, elapsed, current_time, mass)
+        return {
+            "api_version": APP_VERSION,
+            "model": {
+                "orbit_initialization": "SGP4 / TEME", "atmosphere": "NRLMSISE-00 via pymsis",
+                "gravity": "Earth central gravity + J2", "drag": "quadratic aerodynamic drag",
+                "integration": "explicit midpoint RK2; altitude-dependent step capped at 1 s",
+                "ablation": "lumped effective heat-flux-to-mass-loss proxy",
+                "fragmentation": "not modeled", "winds": "not modeled",
+            },
+            "object": {
+                "object_type": req.object_type, "material_label": req.material_label,
+                "initial_mass_kg": initial_mass, "reference_area_m2": req.reference_area_m2,
+                "drag_coefficient": req.drag_coefficient, "nose_radius_m": req.nose_radius_m,
+                "heat_of_ablation_j_kg": req.heat_of_ablation_j_kg,
+                "ablation_efficiency": req.ablation_efficiency,
+                "heated_area_factor": req.heated_area_factor,
+            },
+            "entry_interface": {
+                "source": entry_source, "time_utc": entry_time.isoformat(),
+                "latitude_deg": entry_geo[0], "longitude_deg": entry_geo[1],
+                "altitude_km": entry_geo[2], "velocity_km_s": float(np.linalg.norm(v0)) / 1000.0,
+            },
+            "status": status, "impact": impact, "elapsed_simulation_s": round(elapsed, 3),
+            "steps": steps, "final_mass_kg": round(mass, 6),
+            "mass_loss_kg": round(initial_mass - mass, 6),
+            "mass_remaining_fraction": round(mass / initial_mass, 8),
+            "peak_dynamic_pressure_Pa": max((p["dynamic_pressure_Pa"] for p in points), default=0.0),
+            "peak_convective_heat_flux_W_m2": max((p["convective_heat_flux_W_m2"] for p in points), default=0.0),
+            "peak_drag_deceleration_m_s2": max((p["drag_deceleration_m_s2"] for p in points), default=0.0),
+            "track": points,
+            "limitations": [
+                "ผลเป็น scenario simulation จาก TLE/OMM ที่ผู้ใช้ส่ง ไม่ใช่ operational re-entry forecast",
+                "ablation เป็น lumped effective proxy ไม่ใช่ thermal conduction หรือ material-response solver",
+                "พื้นที่หน้าตัดและ drag coefficient คงที่; ไม่มี tumble หรือ aerodynamic shape change",
+                "ยังไม่มี fragmentation, fragment cloud, lift, wind field หรือ debris survival model",
+                "ไม่มี covariance หรือ uncertainty propagation; track ไม่ใช่ impact corridor",
+                "คุณสมบัติวัสดุและพารามิเตอร์การระเหยต้องมาจากข้อมูลหรือสมมติฐานที่ผู้ใช้ระบุ",
+            ],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"v6 re-entry scenario failed: {str(exc)[:300]}") from exc
+
 
 
 @app.post("/api/v1/simulate")

@@ -1,4 +1,4 @@
-// ===== Thai Re-entry Predictor app.js v4.0 =====
+// ===== Thai Re-entry Predictor app.js v5.2 Unified TLE/OMM =====
 // หมายเหตุ: ผลลัพธ์เป็นการประมาณจากข้อมูล TLE สาธารณะ ไม่ใช่การพยากรณ์ระดับปฏิบัติการ
 const DAY=86400000,HOUR=3600000;
 const MU_A=42241.1;            // กม. : a = MU_A / n^(2/3)  (n = รอบ/วัน)
@@ -85,7 +85,7 @@ async function fetchTLE(id){
             epoch:parseTLEEpoch(ex.line1),source:data.source||'Cloud OMM',source_url:data.source_url||'',
             omm_fields:data.omm_fields||null,format:'OMM+TLE'};
           if(!tleCandidate||ommCandidate.epoch>tleCandidate.epoch)tleCandidate=ommCandidate;
-          else if(Math.abs(ommCandidate.epoch-tleCandidate.epoch)<HOUR){
+          else if(Math.abs(ommCandidate.epoch-tleCandidate.epoch)<1000){
             tleCandidate.omm_fields=ommCandidate.omm_fields;tleCandidate.format='OMM+TLE';
           }
         }
